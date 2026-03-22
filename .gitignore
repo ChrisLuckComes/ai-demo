@@ -208,3 +208,6 @@ __marimo__/
 
 # 向量数据库目录
 chroma_db/
+
+# 对话历史（本地运行状态/隐私数据）
+chat_history.json
