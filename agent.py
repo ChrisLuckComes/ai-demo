@@ -1,6 +1,6 @@
 import os
 import sys
-import chromadb
+from chromadb import PersistentClient, chromadb
 import asyncio
 import json
 import redis.asyncio as redis
@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy.orm import declarative_base
 from sqlalchemy import text, Column, Integer, String, Text, DateTime, select
 from datetime import datetime
+from resume_parser import ResumeParser
 
 # 定义Base ORM基类
 Base = declarative_base()
@@ -113,6 +114,47 @@ class ResumeAgent:
 
         self.cache_expire = 3600  # 缓存1小时
 
+        self.parser = ResumeParser(chunk_size=200, overlap=50)  # 初始化简历解析器
+
+    async def _extract_candidate_name(self, question=str):
+        """从用户问题中提取候选人姓名的简单方法，没有返回None"""
+        prompt = f"""
+        从以下问题中提取候选人姓名，如果没有明确的姓名，返回'None'：
+        问题：{question}
+        """
+        response = await self.client_ai.models.generate_content(
+            model=self.model_name, contents=prompt
+        )
+        name = response.text.strip()
+        return name if name != "None" else None
+
+    def add_resume(self, file_path, candidate_name):
+        # 1. 提取并切分
+        doc_text = self.parser.extract_from_docx(file_path)
+        chunks = self.parser.get_chunks(doc_text)
+
+        # 生成向量
+        embeddings = [self._get_embedding(chunk) for chunk in chunks]
+
+        # 2. 准备元数据,每一段都带上候选人姓名
+        metadatas = [
+            {"candidate_name": candidate_name, "source": file_path} for _ in chunks
+        ]
+        ids = [f"{candidate_name}_{i}" for i in range(len(chunks))]
+
+        # 3. 存入ChromaDB
+        self.collection.upsert(
+            ids=ids,
+            metadatas=metadatas,
+            documents=chunks,
+            embeddings=embeddings,
+        )
+
+        test_res = self.collection.get(limit=1)
+        print(f"📦 数据库状态检查: {test_res['documents']}")
+
+        return len(chunks)
+
     async def _get_cache_key(self, user_id: str):
         return f"chat_cache:{user_id}"
 
@@ -136,10 +178,12 @@ class ResumeAgent:
                 )
                 session.add(new_message)
             # 离开async with时，session会自动关闭
-        
+
         # 2. 更新Redis缓存
         cache_key = await self._get_cache_key(user_id)
-        await self.redis_client.delete(cache_key)  # 删除旧缓存，下一次查询会从PG加载最新数据
+        await self.redis_client.delete(
+            cache_key
+        )  # 删除旧缓存，下一次查询会从PG加载最新数据
 
     async def _load_history(self, user_id, limit: int = 10):
         """双级缓存查询 Redis->PG"""
@@ -183,18 +227,7 @@ class ResumeAgent:
         )
         return result.embeddings[0].values
 
-    def sync_data(self, data_list):
-        # 同步数据到数据库
-        for item in data_list:
-            vector = self._get_embedding(item["text"])
-            self.collection.upsert(
-                ids=[item["id"]],
-                embeddings=[vector],
-                documents=[item["text"]],
-            )
-        print("数据同步完成")
-
-    async def ask(self, user_query: str, user_id: str):
+    async def ask(self, question: str, user_id: str, search_filter=None):
         # 1. 如果会话没有创建，尝试从磁盘恢复
         if user_id not in self.sessions:
             print(f"为用户 {user_id} 创建新会话")
@@ -211,8 +244,17 @@ class ResumeAgent:
             )
 
         # 2. 完整的RAG问答流程
-        query_vector = self._get_embedding(user_query)
-        results = self.collection.query(query_embeddings=[query_vector], n_results=1)
+        detected_name = await self._extract_candidate_name(question) if not search_filter else search_filter.get("candidate_name")
+        enhanced_query = f"候选人:{detected_name} {question}" if detected_name else question
+        
+        query_vector = self._get_embedding(enhanced_query)
+
+
+        results = self.collection.query(
+            query_embeddings=[query_vector], 
+            n_results=8, 
+        )
+
         context = (
             results["documents"][0][0]
             if results["documents"][0]
@@ -220,7 +262,7 @@ class ResumeAgent:
         )
 
         # 3. 构造增强prompt
-        full_input = f"【参考背景】：{context}\n\n【用户问题】：{user_query}"
+        full_input = f"【参考背景】：{context}\n\n【用户问题】：{question}"
 
         # 4. 使用chat_session.send_message来发送消息
         try:
@@ -228,50 +270,48 @@ class ResumeAgent:
             response_text = response.text
         except Exception as e:
             print(f"Error while sending message: {e}")
-            response_text = f"对不起，处理您的请求时出错。可能是API超额，这是模拟恢复，我已收到问题:{user_query}"
+            response_text = f"对不起，处理您的请求时出错。可能是API超额，这是模拟恢复，我已收到问题:{question}"
 
         # 5. 持久化：每次对话完，更新磁盘上的记忆
-        self.histories[user_id].append(
-            {"role": "user", "parts": [{"text": user_query}]}
-        )
+        self.histories[user_id].append({"role": "user", "parts": [{"text": question}]})
         self.histories[user_id].append(
             {"role": "model", "parts": [{"text": response_text}]}
         )
 
         # 6. 异步写入数据库
-        await self._save_message(user_id, "user", user_query)
+        await self._save_message(user_id, "user", question)
         await self._save_message(user_id, "model", response_text)
 
         return response_text
 
 
 # 程序入口
-# async def main():
-#     # 初始化agent
-#     agent = ResumeAgent()
+async def main():
+    # 初始化agent
+    agent = ResumeAgent()
 
-#     print("AI职业经纪人已启动，输入'exit'退出")
+    print("AI职业经纪人已启动，输入'exit'退出")
 
-#     # 准备简历数据
-#     resumes = [
-#         {
-#             "id": "exp_1",
-#             "text": "9年研发经验，熟悉架构设计，主导过多个大型项目的开发。",
-#         },
-#         {"id": "exp_2", "text": "擅长金融量化交易系统开发，熟悉A股交易机制"},
-#     ]
+    # # 准备简历数据
+    # resumes = [
+    #     {
+    #         "id": "exp_1",
+    #         "text": "9年研发经验，熟悉架构设计，主导过多个大型项目的开发。",
+    #     },
+    #     {"id": "exp_2", "text": "擅长金融量化交易系统开发，熟悉A股交易机制"},
+    # ]
 
-#     # 同步数据
-#     agent.sync_data(resumes)
+    # # 同步数据
+    # agent.sync_data(resumes)
 
-#     while True:
-#         user_input = input("请输入问题：")
-#         if user_input.lower() == "exit":
-#             print("退出程序")
-#             break
-#         answer = await agent.ask(user_input, user_id)
-#         print(f"AI的回答是：{answer}")
+    # while True:
+    #     user_input = input("请输入问题：")
+    #     if user_input.lower() == "exit":
+    #         print("退出程序")
+    #         break
+    #     answer = await agent.ask(user_input, user_id)
+    #     print(f"AI的回答是：{answer}")
 
 
-# if __name__ == "__main__":
-#     asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
