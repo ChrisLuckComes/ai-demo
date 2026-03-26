@@ -87,3 +87,11 @@ class EvaluationRequest(BaseModel):
     candidate_name: str  # 候选人姓名
     user_id: str  # 用户ID
     phone: str  # 手机号码
+
+
+class JDAnalysisRequest(BaseModel):
+    jd_text: str
+
+
+class JDAnalysisResponse(BaseModel):
+    keywords: List[str]

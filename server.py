@@ -1,4 +1,4 @@
-import asyncio
+import json
 
 from fastapi import (
     FastAPI,
@@ -13,13 +13,14 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
-from models import QueryRequest, EvaluationRequest, Resume, ResumeStatus
+from models import JDAnalysisRequest, QueryRequest, EvaluationRequest, Resume, ResumeStatus
 from agent import ResumeAgent
 from contextlib import asynccontextmanager
 from sqlalchemy.orm import Session
 from database import engine, get_db, redis_client, Base
 import os
 import shutil
+import hashlib
 
 
 @asynccontextmanager
@@ -54,6 +55,31 @@ app.add_middleware(
 @app.get("/")
 async def root():
     return {"message": "AI职业经纪人已启动，访问/chat接口进行对话"}
+
+
+@app.post("/analyze_jd", summary="分析JD描述，返回关键词")
+async def analyze_jd(request: JDAnalysisRequest):
+    jd_text = request.jd_text.strip()
+    if not jd_text:
+        return {"keywords": []}
+    # 生成JD摘要作为缓存key
+    jd_hash = hashlib.md5(jd_text.encode("utf-8")).hexdigest()
+    cache_key = f"jd_analysis:{jd_hash}"
+    # 检查redis缓存
+    if agent.redis_client:
+        cached = await agent.redis_client.get(cache_key)
+        if cached:
+            try:
+                return json.loads(cached)
+            except Exception:
+                pass
+    # AI分析JD关键词
+    keywords = await agent.analyze_jd_keywords(jd_text)
+    result = {"jd": jd_text, "keywords": keywords}
+    # 存入redis缓存，有效期60分钟
+    if agent.redis_client:
+        await agent.redis_client.setex(cache_key, 3600, json.dumps(result, ensure_ascii=False))
+    return result
 
 
 @app.post(
@@ -107,50 +133,40 @@ async def upload_resume(
         "status": "pending",
     }
 
-    # # 1. 临时保存文件
-    # temp_path = f"temp_{file.filename}"
-    # with open(temp_path, "wb") as buffer:
-    #     shutil.copyfileobj(file.file, buffer)
-
-    # try:
-    #     # 2. 调用Agent方法处理文件
-    #     num_chunks = await agent.add_resume(temp_path, candidate_name, phone)
-    #     return {
-    #         "status": "success",
-    #         "candidate_name": candidate_name,
-    #         "chunks_added": num_chunks,
-    #         "message": "简历已解析并存入向量库",
-    #     }
-    # except Exception as e:
-    #     raise HTTPException(status_code=500, detail=str(e))
-    # finally:
-    #     # 3. 删除临时文件
-    #     if os.path.exists(temp_path):
-    #         os.remove(temp_path)
-
-
 @app.post(
     "/evaluate",
     summary="评估简历",
     description="根据候选人姓名和简历内容，AI经纪人返回评估结果",
 )
 async def evaluate_resume(request: EvaluationRequest, db: Session = Depends(get_db)):
-    # 1. 先查询数据库有没有这个简历
+    # 1. 校验参数，JD和JD关键词必填
+    jd = getattr(request, "jd", None)
+    jd_keywords = getattr(request, "jd_keywords", None)
+    if not jd or not jd_keywords:
+        raise HTTPException(status_code=400, detail="请先进行JD分析，获取JD描述和关键词")
+
+    # 2. 查询数据库有没有这个简历
     existing_resume = await agent.check_and_get_evaluation(
         request.user_id, request.candidate_name, request.phone, db=db
     )
-
     if not existing_resume:
-        # 2. 如果没有，就返回一个提示，要求先上传简历
         raise HTTPException(
             status_code=404,
             detail="未找到对应的简历，请先上传简历后再进行评估",
         )
 
+    # 若数据库已有结构化评估结果且包含雷达图数据，直接返回
     if existing_resume.evaluation_result:
-        return {"evaluation": existing_resume.evaluation_result}
+        result = existing_resume.evaluation_result
+        if "radarData" in result and "radarIndicators" in result:
+            return {"evaluation": result}
+        if "radar_scores" in result and "radar_indicators" in result:
+            result["radarData"] = result["radar_scores"]
+            result["radarIndicators"] = result["radar_indicators"]
+            return {"evaluation": result}
 
-    evaluation = await agent.evaluate_resume(existing_resume.content)
+    # 3. 评估时传递JD内容和关键词
+    evaluation = await agent.evaluate_resume(existing_resume.content, jd=jd, jd_keywords=jd_keywords)
     return {"evaluation": evaluation}
 
 

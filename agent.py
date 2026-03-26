@@ -79,6 +79,46 @@ class ResumeAgent:
 
         self.parser = ResumeParser(chunk_size=200, overlap=50)  # 初始化简历解析器
 
+    async def extract_jd_info(self, jd_text: str):
+        """
+        直接调用AI抽取岗位、目标、约束，供function calling
+        """
+        prompt = f'请从以下JD描述中提取岗位名称、岗位目标、岗位约束，输出JSON：\nJD描述：{jd_text}\n输出示例：{{"role":"前端开发工程师","objective":"负责核心前端架构设计","constraints":"本科及以上学历，5年以上经验"}}'
+        # 注意：此处需有event loop支持
+        from google import genai
+        import os
+
+        client_ai = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        model_name = os.getenv("GEMINI_MODEL_NAME")
+        response = await client_ai.aio.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config={"response_mime_type": "application/json"},
+        )
+        try:
+            return json.loads(response.text)
+        except Exception:
+            return {
+                "role": "岗位未知",
+                "objective": "目标未知",
+                "constraints": "无特殊约束",
+            }
+
+    async def analyze_jd_keywords(self, jd_text: str):
+        """
+        调用AI分析JD描述，返回关键词列表
+        """
+        prompt = f'请从以下JD描述中提取5个最重要的岗位关键词，输出JSON数组：\n{jd_text}\n输出示例：["Vue3","性能优化","团队管理"]'
+        response = await self.client_ai.aio.models.generate_content(
+            model=self.model_name,
+            contents=prompt,
+            config={"response_mime_type": "application/json"},
+        )
+        try:
+            return json.loads(response.text)
+        except Exception:
+            return []
+
     async def check_and_get_evaluation(
         self, user_id: str, candidate_name: str, phone: str, db: AsyncSession = None
     ):
@@ -93,23 +133,89 @@ class ResumeAgent:
         record = result.scalar_one_or_none()
         return record
 
-    async def evaluate_resume(self, resume_text: str):
-        # 结构化prompt
+    async def evaluate_resume(
+        self, resume_text: str, jd: str = None, jd_keywords: list = None
+    ):
+        """
+        通过function calling获取岗位、目标、约束，不再写死prompt
+        """
+        # 1. 先让AI分析JD，抽取岗位、目标、约束
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "extract_jd_info",
+                    "description": "从JD描述中提取岗位、目标、约束",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "role": {"type": "string", "description": "岗位名称"},
+                            "objective": {"type": "string", "description": "岗位目标"},
+                            "constraints": {
+                                "type": "string",
+                                "description": "岗位约束",
+                            },
+                        },
+                        "required": ["role", "objective", "constraints"],
+                    },
+                },
+            }
+        ]
+        jd_info_prompt = (
+            f"请从以下JD描述中提取岗位、目标、约束，调用extract_jd_info函数：\n{jd}"
+        )
+        jd_info_resp = await self.client_ai.aio.models.generate_content(
+            model=self.model_name,
+            contents=jd_info_prompt,
+            tools=tools,
+            config={"response_mime_type": "application/json"},
+        )
+        try:
+            jd_info = json.loads(jd_info_resp.text)
+        except Exception:
+            jd_info = {"role": "", "objective": "", "constraints": ""}
+
+        # 2. 生成评估prompt，动态拼接岗位、目标、约束
         prompt = f"""
-        ROLE: 资深前端技术专家
-            OBJECTIVE: 评估以下简历，判定是否符合“资深前端”要求。
-            
-            CONSTRAINTS:
-            - 门槛：本科且5年以上经验。
-            - 逻辑：按照 (C)过程 > (B)架构 > (A)数据 优先级寻找实质产出。
-            - 加分项：体现 AI 工具提效。
+        ROLE: {jd_info.get("role", "岗位未知")}
+        OBJECTIVE: {jd_info.get("objective", "目标未知")}
+        CONSTRAINTS: {jd_info.get("constraints", "无特殊约束")}
+        
+        JD描述: {jd}
+        JD关键词: {", ".join(jd_keywords or [])}
+        
+        评估以下简历，判定是否符合岗位要求，并输出结构化评估结果。
+        必须输出如下结构字段：
+            - radar_scores: [技术深度, 项目经验, 软技能, 背景实力, AI提效]，每项0-100分
+            - radar_indicators: [{"name": "技术深度", "max": 100}, ...]
+            - tech_stack_citations: 每个技术栈的引用原文片段数组
+            - key_achievements_citations: 每个成就的引用原文片段数组
 
-            INPUT_RESUME:
-            {resume_text}
+        INPUT_RESUME:
+        {resume_text}
 
-            OUTPUT_FORMAT:
-            请严格按照 JSON 格式输出，参考以下结构：
-            {ResumeEvaluation.model_json_schema()}
+        OUTPUT_FORMAT:
+        
+        请严格按照如下JSON格式输出：
+        {{
+            "decision": "评估结论",
+            "match_score": 92,
+            "decision_range": "Highly Frontend Expert",
+            "radar_scores": [80, 90, 70, 85, 75],
+            "radar_indicators": [
+                {{"name": "技术深度", "max": 100}}, # 对比 JD 要求的框架深度（如 Vue3 原理、性能优化经验）
+                {{"name": "项目经验", "max": 100}}, # 对比简历中的项目复杂度和JD 要求的项目经验
+                {{"name": "软技能", "max": 100}}, # 对比 JD 要求的软技能
+                {{"name": "背景实力", "max": 100}}, # 对比 JD 要求的背景实力
+                {{"name": "AI提效", "max": 100}} # 对比 JD 要求的 AI 提效能力
+            ],
+            "tech_stack": ["Vue 2/3", "TypeScript", "Electron"],
+            "tech_stack_citations": ["原文片段1", "原文片段2", "原文片段3"],
+            "key_achievements": ["主导Electron桌面端重构", "JsonSchema元数据驱动"],
+            "key_achievements_citations": ["原文片段A", "原文片段B"],
+            "ai_bonus": "深度集成AI开发流",
+            "risks": ["2022年及2025年两段工作经历时间较短"]
+        }}
         """
 
         response = await self.client_ai.aio.models.generate_content(
@@ -120,6 +226,12 @@ class ResumeAgent:
 
         # 转换为python对象
         result = json.loads(response.text)
+        # 兼容前端字段
+        result["radarData"] = result.get("radar_scores")
+        result["radarIndicators"] = result.get("radar_indicators")
+        result["citations"] = (result.get("key_achievements_citations") or []) + (
+            result.get("tech_stack_citations") or []
+        )
         return result
 
     async def delete_old_vector_data(self, phone: str):
@@ -390,7 +502,7 @@ class ResumeAgent:
         )
 
         context = (
-            results["documents"][0][0]
+            "\n".join(results["documents"][0])
             if results["documents"][0]
             else "(未找到相关简历描述)"
         )
