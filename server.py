@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import (
     FastAPI,
     BackgroundTasks,
@@ -6,7 +8,10 @@ from fastapi import (
     Form,
     HTTPException,
     Depends,
+    Request,
 )
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from models import QueryRequest, EvaluationRequest, Resume, ResumeStatus
 from agent import ResumeAgent
@@ -35,6 +40,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 agent = ResumeAgent(redis_client)
+
+# CORS 配置，允许所有来源（可根据需要指定 origins）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 生产环境建议指定前端域名
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/")
@@ -155,19 +169,24 @@ async def query_resume(
     return {"reply": answer}
 
 
+# SSE流式响应的/chat接口
 @app.post(
     "/chat",
-    summary="与AI职业经纪人对话",
-    description="发送问题给 AI 经纪人，支持多轮对话记忆",
+    summary="与AI职业经纪人对话（SSE流式）",
+    description="发送问题给 AI 经纪人，流式返回回复内容，支持多轮对话记忆",
 )
 async def chat_endpoint(
-    request: QueryRequest,
+    request: Request,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    answer = await agent.ask(request.text, request.user_id, db=db)
-    background_tasks.add_task(agent.async_persistence, request.user_id, answer)
-    return {"reply": answer}
+    req_json = await request.json()
+    user_id = req_json.get("user_id")
+    text = req_json.get("text")
+    # 获取完整AI回复
+    answer = agent.ask(text, user_id, db=db)
+
+    return StreamingResponse(answer, media_type="text/event-stream")
 
 
 if __name__ == "__main__":

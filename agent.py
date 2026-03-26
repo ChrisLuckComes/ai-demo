@@ -369,7 +369,6 @@ class ResumeAgent:
                 config={
                     "system_instruction": self.system_instruction,
                     "tools": [get_project_tech_stack, get_current_date],
-                    "response_mime_type": "application/json",
                 },
             )
 
@@ -399,25 +398,31 @@ class ResumeAgent:
         # 3. 构造增强prompt
         full_input = f"【参考背景】：{context}\n\n【用户问题】：{question}"
 
-        # 4. 使用chat_session.send_message来发送消息
+        # 4. 使用chat_session.send_message_stream获取流式响应，边生成边存储完整回答内容
+        full_response_content = ""
         try:
-            response = await self.sessions[user_id].send_message(full_input)
-            response_text = response.text
+            response_stream = await self.sessions[user_id].send_message_stream(
+                full_input
+            )
+            async for chunk in response_stream:
+                if chunk.text:
+                    content = chunk.text
+                    full_response_content += content
+                    yield content
         except Exception as e:
-            print(f"Error while sending message: {e}")
-            response_text = f"对不起，处理您的请求时出错。可能是API超额，这是模拟恢复，我已收到问题:{question}"
+            error_msg = f"\n[服务异常]: {str(e)}"
+            yield error_msg
+            full_response_content += error_msg
 
         # 5. 持久化：每次对话完，更新磁盘上的记忆
         self.histories[user_id].append({"role": "user", "parts": [{"text": question}]})
         self.histories[user_id].append(
-            {"role": "model", "parts": [{"text": response_text}]}
+            {"role": "model", "parts": [{"text": full_response_content}]}
         )
 
         # 6. 异步写入数据库
         await self._save_message(user_id, "user", question, db=db)
-        await self._save_message(user_id, "model", response_text, db=db)
-
-        return response_text
+        await self._save_message(user_id, "model", full_response_content, db=db)
 
 
 # 程序入口
