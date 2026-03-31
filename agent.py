@@ -123,18 +123,14 @@ class ResumeAgent:
             f"针对当前岗位要求，{base_name} 最大的风险点是什么？",
         ]
 
-    async def analyze_jd(self, jd_text: str, target_seniority: str | None = None) -> JDAnalysisResponse:
+    async def analyze_jd(self, jd_text: str) -> JDAnalysisResponse:
         cleaned_text = jd_text.strip()
         if not cleaned_text:
             return JDAnalysisResponse(keywords=[])
 
-        return JDAnalysisResponse(
-            keywords=await self._extract_jd_keywords(cleaned_text, target_seniority)
-        )
+        return JDAnalysisResponse(keywords=await self._extract_jd_keywords(cleaned_text))
 
-    async def _extract_jd_keywords(
-        self, text: str, target_seniority: str | None = None
-    ) -> list[str]:
+    async def _extract_jd_keywords(self, text: str) -> list[str]:
         prompt = ChatPromptTemplate.from_messages(
             [
                 (
@@ -142,26 +138,19 @@ class ResumeAgent:
                     "你是招聘JD关键词抽取助手。你的唯一任务是从输入原文中提取关键词。"
                     "禁止补充原文未出现的词，禁止改写为同义词，禁止根据常识推断。"
                     "只保留文本中能直接定位到的技能、工具、业务领域、职责方向、方法论等关键词。"
-                    "不要输出完整句子，不要输出解释，不要把目标级别当作关键词，除非它在原文中明确出现。"
+                    "不要输出完整句子，不要输出解释。"
                     "关键词数量控制在4到8个，若有效关键词不足则按实际数量返回。"
                 ),
                 (
                     "user",
-                    "请从下面JD原文中提取关键词，仅返回结构化结果。\n"
-                    "目标级别（仅用于理解重点，不能凭空补充成关键词）：{target_seniority}\n\n"
-                    "JD原文：\n{text}",
+                    "请从下面JD原文中提取关键词，仅返回结构化结果。\n\nJD原文：\n{text}",
                 ),
             ]
         )
 
         try:
             structured_llm = self.llm.with_structured_output(JDKeywordExtractionResult)
-            raw_result = await (prompt | structured_llm).ainvoke(
-                {
-                    "target_seniority": target_seniority or "未指定",
-                    "text": text,
-                }
-            )
+            raw_result = await (prompt | structured_llm).ainvoke({"text": text})
             result: JDKeywordExtractionResult = self._coerce_model(
                 raw_result, JDKeywordExtractionResult
             )
@@ -171,16 +160,15 @@ class ResumeAgent:
         except Exception:
             pass
 
-        return self._fallback_keywords(text, target_seniority)
+        return self._fallback_keywords(text)
 
     async def evaluate_resume(
         self,
         resume_text: str,
         jd_text: str,
         jd_keywords: list[str] | None = None,
-        target_seniority: str | None = None,
     ) -> dict:
-        extracted_keywords = await self._extract_jd_keywords(jd_text, target_seniority)
+        extracted_keywords = await self._extract_jd_keywords(jd_text)
         keywords = self._unique_strings(jd_keywords or extracted_keywords)
 
         try:
@@ -196,7 +184,6 @@ class ResumeAgent:
                         "user",
                         """
                         请结合以下信息评估候选人：
-                        目标级别: {target_seniority}
                         JD关键词: {keywords}
 
                         JD全文:
@@ -219,7 +206,6 @@ class ResumeAgent:
             )
             raw_result = await (prompt | structured_llm).ainvoke(
                 {
-                    "target_seniority": target_seniority or "",
                     "keywords": ", ".join(keywords),
                     "jd_text": jd_text,
                     "resume_text": resume_text,
@@ -484,7 +470,7 @@ class ResumeAgent:
             return clauses[0]
         return {"$and": clauses}
 
-    def _fallback_keywords(self, text: str, target_seniority: str | None = None) -> list[str]:
+    def _fallback_keywords(self, text: str) -> list[str]:
         stopwords = {
             "负责",
             "熟悉",
@@ -539,8 +525,6 @@ class ResumeAgent:
         matched_library = [item for item in library if item.lower() in text.lower()]
         tokens = re.findall(r"[A-Za-z][A-Za-z0-9+#./-]{1,}|[\u4e00-\u9fff]{2,8}", text)
         keywords = [token for token in tokens if token not in stopwords and len(token) >= 2]
-        if target_seniority and target_seniority.lower() in text.lower():
-            keywords.append(target_seniority)
         return self._unique_strings([*matched_library, *keywords])[:8]
 
     def _normalize_keyword_candidates(self, candidates: Iterable[str], text: str) -> list[str]:

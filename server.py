@@ -68,14 +68,13 @@ async def analyze_jd(request: JDAnalysisRequest):
     if not jd_text:
         return {"keywords": []}
 
-    cache_payload = f"{request.target_seniority or ''}\n{jd_text}"
-    cache_key = f"jd_analysis:{hashlib.md5(cache_payload.encode('utf-8')).hexdigest()}"
+    cache_key = f"jd_analysis:{hashlib.md5(jd_text.encode('utf-8')).hexdigest()}"
     if redis_client:
         cached = await redis_client.get(cache_key)
         if cached:
             return json.loads(cached)
 
-    result = (await agent.analyze_jd(jd_text, request.target_seniority)).model_dump()
+    result = (await agent.analyze_jd(jd_text)).model_dump()
     if redis_client:
         await redis_client.setex(
             cache_key,
@@ -207,7 +206,6 @@ async def evaluate_resume(request: EvaluationRequest, db: AsyncSession = Depends
         resume_text=resume.content,
         jd_text=jd_text,
         jd_keywords=request.jd_keywords,
-        target_seniority=request.target_seniority,
     )
     resume.evaluation_result = evaluation
     resume.status = ResumeStatus.COMPLETED

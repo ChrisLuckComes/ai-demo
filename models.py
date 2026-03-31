@@ -79,13 +79,11 @@ class EvaluationRequest(BaseModel):
     resume_id: Optional[int] = None
     candidate_name: Optional[str] = None
     phone: Optional[str] = None
-    target_seniority: Optional[str] = None
     jd_keywords: Optional[List[str]] = None
 
 
 class JDAnalysisRequest(BaseModel):
     jd_text: str
-    target_seniority: Optional[str] = None
 
 
 class JDAnalysisResponse(BaseModel):
