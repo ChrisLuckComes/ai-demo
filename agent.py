@@ -1,36 +1,59 @@
+import asyncio
 import json
 import importlib
 import os
-import re
 import tempfile
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterable, TypeVar, cast
+from typing import AsyncIterator, cast
 
 from dotenv import load_dotenv
 import cv2  # type: ignore[import-not-found]
 from langchain_chroma import Chroma
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import BaseMessage
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 import numpy as np
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from pydantic import BaseModel
-
 from models import (
     ChatMessage,
     ChatSuggestionsResponse,
+    EvaluationItemsResult,
     EvaluationResult,
+    EvaluationScoreResult,
+    EvaluationSummaryResult,
     JDAnalysisResponse,
     JDKeywordExtractionResult,
     OCRResponse,
-    RadarMetric,
+)
+from agent_prompts import (
+    SYSTEM_INSTRUCTION,
+    build_chat_prompt,
+    build_evaluation_prompt,
+    build_evaluation_items_prompt,
+    build_evaluation_score_prompt,
+    build_evaluation_summary_prompt,
+    build_follow_up_prompt,
+    build_jd_keyword_prompt,
+)
+from agent_utils import (
+    build_chat_fallback,
+    build_radar_metrics,
+    build_resume_sources,
+    chunk_to_text,
+    coerce_model,
+    fallback_evaluation,
+    fallback_keywords,
+    format_context_docs,
+    format_sources_for_prompt,
+    normalize_evaluation_items,
+    normalize_keyword_candidates,
+    normalize_source_ids,
+    normalize_sources,
+    to_langchain_message,
+    unique_strings,
 )
 from resume_parser import ResumeParser
-
-
-ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
 class ResumeAgent:
@@ -41,15 +64,22 @@ class ResumeAgent:
             os.environ["GOOGLE_API_KEY"] = gemini_api_key
 
         base_dir = Path(__file__).resolve().parent
+        # LLM 负责推理与生成，embedding 负责把简历切片转成向量用于检索。
         self.llm = ChatGoogleGenerativeAI(
             model=os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash"),
             temperature=0.2,
+        )
+        # 评估链路更强调稳定性，因此单独使用低温模型，减少同输入下的结果漂移。
+        self.evaluation_llm = ChatGoogleGenerativeAI(
+            model=os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash"),
+            temperature=0,
         )
         self.embeddings = GoogleGenerativeAIEmbeddings(
             model=os.getenv("GEMINI_EMBEDDING_MODEL_NAME", "models/text-embedding-004"),
         )
         rapidocr_module = self._load_rapidocr_module()
         self.ocr_engine = rapidocr_module.RapidOCR() if rapidocr_module is not None else None
+        # Chroma 持久化保存简历分片，后续聊天和评估都从这里做语义检索。
         self.vector_store = Chroma(
             collection_name="resume_agent",
             embedding_function=self.embeddings,
@@ -58,19 +88,16 @@ class ResumeAgent:
         self.redis_client = redis_client
         self.cache_expire = 3600
         self.parser = ResumeParser(chunk_size=500, overlap=80)
-        self.system_instruction = (
-            "你是一名专业、冷静、重证据的招聘顾问。"
-            "你的判断必须基于提供的简历内容、JD信息和检索片段。"
-            "禁止补充候选人未明确写出的经历、技能、业绩或职责，禁止基于常识脑补。"
-            "如果证据不足，必须明确说明“证据不足”或“简历中没有直接体现”。"
-            "结论要服务招聘决策，语言简洁、直接、可执行，避免空泛表扬。"
-            "输出时优先引用具体事实，例如项目、技术、职责、年限、业务场景。"
-        )
+        self.system_instruction = SYSTEM_INSTRUCTION
+        self.jd_keyword_timeout_seconds = float(os.getenv("JD_KEYWORD_TIMEOUT_SECONDS", "15"))
+        self.jd_keyword_prompt = build_jd_keyword_prompt()
+        self.jd_keyword_chain = self.jd_keyword_prompt | self.llm.with_structured_output(JDKeywordExtractionResult)
 
     async def extract_text_from_image(self, file_bytes: bytes, mime_type: str) -> OCRResponse:
         if self.ocr_engine is None:
             raise ValueError("未安装 rapidocr_onnxruntime，无法执行图片OCR")
 
+        # 先把上传的二进制图片解码成 OpenCV 可处理的矩阵，再交给 OCR 引擎识别。
         image_buffer = np.frombuffer(file_bytes, dtype=np.uint8)
         decoded_image = cv2.imdecode(image_buffer, cv2.IMREAD_COLOR)
         if decoded_image is None:
@@ -89,20 +116,7 @@ class ResumeAgent:
         answer: str,
         candidate_name: str | None = None,
     ) -> list[str]:
-        prompt = ChatPromptTemplate.from_template(
-            """
-            你是招聘顾问，请根据本轮问答生成 3 条适合继续追问的问题。
-            候选人：{candidate_name}
-            用户问题：{question}
-            AI回答：{answer}
-
-            要求：
-            1. 每条都是中文追问句子
-            2. 3条问题分别优先覆盖：技术深度、真实职责或ownership、风险确认
-            3. 要紧扣当前问答里已经出现的信息，不要泛泛提问
-            4. 避免重复，避免空话，避免一次问太多点
-            """
-        )
+        prompt = build_follow_up_prompt()
         try:
             structured_llm = self.llm.with_structured_output(ChatSuggestionsResponse)
             raw_result = await (prompt | structured_llm).ainvoke(
@@ -112,10 +126,10 @@ class ResumeAgent:
                     "answer": answer,
                 }
             )
-            result: ChatSuggestionsResponse = self._coerce_model(
+            result: ChatSuggestionsResponse = coerce_model(
                 raw_result, ChatSuggestionsResponse
             )
-            suggestions = self._unique_strings(result.suggestions)
+            suggestions = unique_strings(result.suggestions)
             if suggestions:
                 return suggestions[:3]
         except Exception:
@@ -136,38 +150,21 @@ class ResumeAgent:
         return JDAnalysisResponse(keywords=await self._extract_jd_keywords(cleaned_text))
 
     async def _extract_jd_keywords(self, text: str) -> list[str]:
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    "你是招聘JD关键词抽取助手。你的唯一任务是从输入原文中提取关键词。"
-                    "禁止补充原文未出现的词，禁止改写为同义词，禁止根据常识推断。"
-                    "只保留文本中能直接定位到的技能、工具、业务领域、职责方向、方法论等关键词。"
-                    "优先保留对招聘筛选最有区分度的词，过滤'负责'、'沟通能力'这类泛词。"
-                    "如果原文中出现英文、缩写、大小写混合写法，尽量保留原文写法。"
-                    "不要输出完整句子，不要输出解释。"
-                    "关键词数量控制在4到8个，若有效关键词不足则按实际数量返回。"
-                ),
-                (
-                    "user",
-                    "请从下面JD原文中提取关键词，仅返回结构化结果。\n\nJD原文：\n{text}",
-                ),
-            ]
-        )
-
         try:
-            structured_llm = self.llm.with_structured_output(JDKeywordExtractionResult)
-            raw_result = await (prompt | structured_llm).ainvoke({"text": text})
-            result: JDKeywordExtractionResult = self._coerce_model(
+            raw_result = await asyncio.wait_for(
+                self.jd_keyword_chain.ainvoke({"text": text}),
+                timeout=self.jd_keyword_timeout_seconds,
+            )
+            result: JDKeywordExtractionResult = coerce_model(
                 raw_result, JDKeywordExtractionResult
             )
-            keywords = self._normalize_keyword_candidates(result.keywords, text)
+            keywords = normalize_keyword_candidates(result.keywords, text)
             if keywords:
                 return keywords[:8]
         except Exception:
             pass
 
-        return self._fallback_keywords(text)
+        return fallback_keywords(text)
 
     async def evaluate_resume(
         self,
@@ -175,56 +172,145 @@ class ResumeAgent:
         jd_text: str,
         jd_keywords: list[str] | None = None,
     ) -> dict:
-        extracted_keywords = await self._extract_jd_keywords(jd_text)
-        keywords = self._unique_strings(jd_keywords or extracted_keywords)
+        keywords, sources = await self.prepare_evaluation_context(
+            resume_text=resume_text,
+            jd_keywords=jd_keywords,
+        )
+        return await self.generate_evaluation(
+            resume_text=resume_text,
+            jd_text=jd_text,
+            keywords=keywords,
+            sources=sources,
+        )
+
+    async def prepare_evaluation_context(
+        self,
+        resume_text: str,
+        jd_keywords: list[str] | None = None,
+    ) -> tuple[list[str], list[dict[str, str]]]:
+        keywords = self.require_jd_keywords(jd_keywords)
+        # 先把简历拆成可引用证据，后面要求模型只能引用这些 source_id。
+        sources = self.build_evaluation_sources(resume_text)
+        return keywords, sources
+
+    def require_jd_keywords(self, jd_keywords: list[str] | None) -> list[str]:
+        keywords = unique_strings(jd_keywords or [])
+        if not keywords:
+            raise ValueError("请先分析JD")
+        return keywords
+
+    def build_evaluation_sources(self, resume_text: str) -> list[dict[str, str]]:
+        return build_resume_sources(resume_text)
+
+    async def generate_evaluation(
+        self,
+        resume_text: str,
+        jd_text: str,
+        keywords: list[str],
+        sources: list[dict[str, str]],
+    ) -> dict:
+        source_block = format_sources_for_prompt(sources)
 
         try:
-            structured_llm = self.llm.with_structured_output(EvaluationResult)
-            prompt = ChatPromptTemplate.from_messages(
-                [
-                    (
-                        "system",
-                        self.system_instruction
-                        + " 输出结构必须适合招聘评审，评分范围为0到100。"
-                        + " 亮点和风险都必须基于简历中的明确证据，禁止写空泛结论。",
-                    ),
-                    (
-                        "user",
-                        """
-                        请结合以下信息评估候选人：
-                        JD关键词: {keywords}
-
-                        JD全文:
-                        {jd_text}
-
-                        简历全文:
-                        {resume_text}
-
-                        评估原则：
-                        1. 只能依据简历中明确出现的信息判断。
-                        2. 如果JD某项要求在简历中没有直接证据，必须视为证据不足，不能脑补。
-                        3. 亮点必须具体到技能、项目、职责、结果或业务场景。
-                        4. 风险必须具体指出缺口、不确定项或需要面试确认的点。
-                        5. 不要使用“潜力不错”“综合素质较强”这类空泛表述。
-
-                        评分参考：
-                        - 90到100：核心技能、项目复杂度、业务场景均高度匹配，且证据充分
-                        - 75到89：大部分要求匹配，存在少量缺口但整体可推进
-                        - 60到74：有相关经历，但关键要求证据不足或存在明显短板
-                        - 0到59：核心要求不匹配，或缺少支持结论的直接证据
-
-                        请返回：
-                        - summary: 2到3句中文结论
-                        - title: 一句简短标题
-                        - decision: 明确结论
-                        - match_score: 0到100整数
-                        - radar_metrics: 4到6个维度，每个维度包含name、value、max
-                        - highlights: 3到5条亮点
-                        - risks: 2到4条风险
-                        """,
-                    ),
-                ]
+            structured_llm = self.evaluation_llm.with_structured_output(EvaluationResult)
+            prompt = build_evaluation_prompt(self.system_instruction)
+            raw_result = await (prompt | structured_llm).ainvoke(
+                {
+                    "keywords": ", ".join(keywords),
+                    "jd_text": jd_text,
+                    "resume_text": resume_text,
+                    "source_block": source_block,
+                }
             )
+            result: EvaluationResult = coerce_model(raw_result, EvaluationResult)
+            payload = result.model_dump()
+            # sources 以服务端切分结果为准，不信任模型回传的 sources，避免它把整份简历原样回显。
+            payload["sources"] = normalize_sources(None, sources)
+            payload["summary_source_ids"] = normalize_source_ids(
+                payload.get("summary_source_ids"), payload["sources"]
+            )
+            payload["highlights"] = normalize_evaluation_items(
+                payload.get("highlights"), payload["sources"]
+            )
+            payload["risks"] = normalize_evaluation_items(payload.get("risks"), payload["sources"])
+            if not payload.get("radar_metrics"):
+                payload["radar_metrics"] = [
+                    metric.model_dump()
+                    for metric in build_radar_metrics(payload["match_score"])
+                ]
+            return payload
+        except Exception:
+            # 结构化输出失败时降级到规则评估，保证接口仍能返回可用结果。
+            return fallback_evaluation(resume_text, keywords, sources)
+
+    async def evaluate_resume_in_steps(
+        self,
+        resume_text: str,
+        jd_text: str,
+        jd_keywords: list[str] | None = None,
+    ) -> dict:
+        keywords, sources = await self.prepare_evaluation_context(
+            resume_text=resume_text,
+            jd_keywords=jd_keywords,
+        )
+        score_result = await self.generate_evaluation_score(
+            resume_text=resume_text,
+            jd_text=jd_text,
+            keywords=keywords,
+        )
+        summary_result = await self.generate_evaluation_summary(
+            resume_text=resume_text,
+            jd_text=jd_text,
+            keywords=keywords,
+            sources=sources,
+            match_score=score_result["match_score"],
+            decision=score_result["decision"],
+        )
+        highlights = await self.generate_evaluation_items(
+            item_type="highlights",
+            resume_text=resume_text,
+            jd_text=jd_text,
+            keywords=keywords,
+            sources=sources,
+            match_score=score_result["match_score"],
+            decision=score_result["decision"],
+            summary=summary_result["summary"],
+        )
+        risks = await self.generate_evaluation_items(
+            item_type="risks",
+            resume_text=resume_text,
+            jd_text=jd_text,
+            keywords=keywords,
+            sources=sources,
+            match_score=score_result["match_score"],
+            decision=score_result["decision"],
+            summary=summary_result["summary"],
+        )
+        normalized_sources = normalize_sources(None, sources)
+        return {
+            "title": score_result["title"],
+            "decision": score_result["decision"],
+            "match_score": score_result["match_score"],
+            "radar_metrics": self.build_radar_payload(score_result["match_score"]),
+            "summary": summary_result["summary"],
+            "summary_source_ids": normalize_source_ids(summary_result["summary_source_ids"], normalized_sources),
+            "highlights": normalize_evaluation_items(highlights["items"], normalized_sources),
+            "risks": normalize_evaluation_items(risks["items"], normalized_sources),
+            "sources": normalized_sources,
+        }
+
+    def build_radar_payload(self, match_score: int) -> list[dict]:
+        return [metric.model_dump() for metric in build_radar_metrics(match_score)]
+
+    async def generate_evaluation_score(
+        self,
+        resume_text: str,
+        jd_text: str,
+        keywords: list[str],
+    ) -> dict:
+        try:
+            structured_llm = self.evaluation_llm.with_structured_output(EvaluationScoreResult)
+            prompt = build_evaluation_score_prompt(self.system_instruction)
             raw_result = await (prompt | structured_llm).ainvoke(
                 {
                     "keywords": ", ".join(keywords),
@@ -232,16 +318,96 @@ class ResumeAgent:
                     "resume_text": resume_text,
                 }
             )
-            result: EvaluationResult = self._coerce_model(raw_result, EvaluationResult)
+            result: EvaluationScoreResult = coerce_model(raw_result, EvaluationScoreResult)
             payload = result.model_dump()
-            if not payload.get("radar_metrics"):
-                payload["radar_metrics"] = [
-                    metric.model_dump()
-                    for metric in self._build_radar_metrics(payload["match_score"])
-                ]
+            payload["match_score"] = max(0, min(100, int(payload["match_score"])))
             return payload
         except Exception:
-            return self._fallback_evaluation(resume_text, jd_text, keywords)
+            fallback = fallback_evaluation(resume_text, keywords, [])
+            return {
+                "title": fallback["title"],
+                "decision": fallback["decision"],
+                "match_score": fallback["match_score"],
+            }
+
+    async def generate_evaluation_summary(
+        self,
+        resume_text: str,
+        jd_text: str,
+        keywords: list[str],
+        sources: list[dict[str, str]],
+        match_score: int,
+        decision: str,
+    ) -> dict:
+        source_block = format_sources_for_prompt(sources)
+        normalized_sources = normalize_sources(None, sources)
+        try:
+            structured_llm = self.evaluation_llm.with_structured_output(EvaluationSummaryResult)
+            prompt = build_evaluation_summary_prompt(self.system_instruction)
+            raw_result = await (prompt | structured_llm).ainvoke(
+                {
+                    "match_score": match_score,
+                    "decision": decision,
+                    "keywords": ", ".join(keywords),
+                    "jd_text": jd_text,
+                    "resume_text": resume_text,
+                    "source_block": source_block,
+                }
+            )
+            result: EvaluationSummaryResult = coerce_model(raw_result, EvaluationSummaryResult)
+            payload = result.model_dump()
+            payload["summary_source_ids"] = normalize_source_ids(payload.get("summary_source_ids"), normalized_sources)
+            return payload
+        except Exception:
+            fallback = fallback_evaluation(resume_text, keywords, sources)
+            return {
+                "summary": fallback["summary"],
+                "summary_source_ids": fallback["summary_source_ids"],
+            }
+
+    async def generate_evaluation_items(
+        self,
+        item_type: str,
+        resume_text: str,
+        jd_text: str,
+        keywords: list[str],
+        sources: list[dict[str, str]],
+        match_score: int,
+        decision: str,
+        summary: str,
+    ) -> dict:
+        source_block = format_sources_for_prompt(sources)
+        normalized_sources = normalize_sources(None, sources)
+        try:
+            structured_llm = self.evaluation_llm.with_structured_output(EvaluationItemsResult)
+            prompt = build_evaluation_items_prompt(self.system_instruction, item_type)
+            raw_result = await (prompt | structured_llm).ainvoke(
+                {
+                    "match_score": match_score,
+                    "decision": decision,
+                    "summary": summary,
+                    "keywords": ", ".join(keywords),
+                    "jd_text": jd_text,
+                    "resume_text": resume_text,
+                    "source_block": source_block,
+                }
+            )
+            result: EvaluationItemsResult = coerce_model(raw_result, EvaluationItemsResult)
+            payload = result.model_dump()
+            payload["items"] = normalize_evaluation_items(payload.get("items"), normalized_sources)
+            return payload
+        except Exception:
+            fallback = fallback_evaluation(resume_text, keywords, sources)
+            fallback_key = "highlights" if item_type == "highlights" else "risks"
+            return {"items": fallback[fallback_key]}
+
+    def build_provisional_evaluation(
+        self,
+        resume_text: str,
+        keywords: list[str],
+        sources: list[dict[str, str]],
+    ) -> dict:
+        return fallback_evaluation(resume_text, keywords, sources)
 
     async def ingest_resume(
         self,
@@ -258,6 +424,7 @@ class ResumeAgent:
 
         temp_path = ""
         try:
+            # 解析库依赖本地文件路径，因此先把上传文件落到临时文件。
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
                 temp_file.write(file_content)
                 temp_path = temp_file.name
@@ -270,6 +437,7 @@ class ResumeAgent:
         if not raw_text.strip():
             raise ValueError("简历内容为空，无法继续处理")
 
+        # 每份简历会被切成多个 chunk 入向量库，便于后续按问题检索局部证据。
         chunks = self.parser.get_chunks(raw_text)
         self.delete_resume_vectors(user_id=user_id, resume_id=resume_id)
         self.vector_store.add_texts(
@@ -316,7 +484,22 @@ class ResumeAgent:
             resume_id=resume_id,
         ):
             chunks.append(chunk)
+        # 非流式接口本质上复用了流式实现，只是把分块结果重新拼接起来。
         return "".join(chunks)
+
+    async def get_chat_sources(
+        self,
+        question: str,
+        user_id: str,
+        candidate_name: str | None = None,
+        resume_id: int | None = None,
+    ) -> list[dict[str, str]]:
+        return await self._retrieve_context_docs(
+            question=question,
+            user_id=user_id,
+            candidate_name=candidate_name,
+            resume_id=resume_id,
+        )
 
     async def stream_chat(
         self,
@@ -326,36 +509,17 @@ class ResumeAgent:
         candidate_name: str | None = None,
         resume_id: int | None = None,
     ) -> AsyncIterator[str]:
+        # 先读历史消息，再检索当前问题最相关的简历片段，最后把二者一起交给 LLM。
         chat_history = await self._load_history(user_id=user_id, db=db)
-        context = await self._retrieve_context(
+        context_docs = await self._retrieve_context_docs(
             question=question,
             user_id=user_id,
             candidate_name=candidate_name,
             resume_id=resume_id,
         )
+        context = format_context_docs(context_docs)
 
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    self.system_instruction
-                    + " 如果检索内容不足以支撑结论，就明确说明证据不足。"
-                    + " 优先回答结论，再补充证据；如果用户问是否匹配、是否具备某能力，"
-                    + "要先给判断，再给依据，最后指出需要进一步确认的风险。",
-                ),
-                MessagesPlaceholder(variable_name="chat_history"),
-                (
-                    "user",
-                    "相关简历片段:\n{context}\n\n"
-                    "回答要求:\n"
-                    "1. 只基于相关简历片段回答。\n"
-                    "2. 如果问题是判断类问题，优先按“结论 -> 证据 -> 风险/待确认点”作答。\n"
-                    "3. 如果问题是信息查询类问题，直接列出找到的事实。\n"
-                    "4. 不要假装看到了上下文之外的信息。\n\n"
-                    "用户问题:\n{question}",
-                ),
-            ]
-        )
+        prompt = build_chat_prompt(self.system_instruction)
         chain = prompt | self.llm
 
         response_parts: list[str] = []
@@ -367,27 +531,30 @@ class ResumeAgent:
                     "question": question,
                 }
             ):
-                text = self._chunk_to_text(chunk)
+                text = chunk_to_text(chunk)
                 if text:
                     response_parts.append(text)
                     yield text
         except Exception:
-            fallback = self._build_chat_fallback(question=question, context=context)
+            # 流式生成失败时仍返回基于检索结果的降级答案，避免前端整段报错。
+            fallback = build_chat_fallback(question=question, context=context)
             response_parts.append(fallback)
             yield fallback
 
         full_response = "".join(response_parts).strip()
+        # 用户问题和 AI 最终回答都会落库，用于多轮对话与缓存重建。
         await self._save_message(user_id=user_id, role="user", content=question, db=db)
         await self._save_message(user_id=user_id, role="ai", content=full_response, db=db)
 
-    async def _retrieve_context(
+    async def _retrieve_context_docs(
         self,
         question: str,
         user_id: str,
         candidate_name: str | None,
         resume_id: int | None,
-    ) -> str:
+    ) -> list[dict[str, str]]:
         search_kwargs: dict[str, object] = {"k": 6}
+        # 通过 metadata filter 把检索范围限制到当前用户/当前简历，避免串数据。
         where = self._build_vector_filter(
             user_id=user_id, resume_id=resume_id, candidate_name=candidate_name
         )
@@ -399,9 +566,21 @@ class ResumeAgent:
                 question
             )
         except Exception:
-            return ""
+            return []
 
-        return "\n\n".join(doc.page_content for doc in docs)
+        context_docs: list[dict[str, str]] = []
+        # 给每个召回片段分配一个 source_id，方便前端展示“答案依据”。
+        for index, doc in enumerate(docs, start=1):
+            snippet = doc.page_content.strip()
+            if not snippet:
+                continue
+            context_docs.append(
+                {
+                    "source_id": f"ctx_{index}",
+                    "snippet": snippet[:700],
+                }
+            )
+        return context_docs
 
     async def _save_message(
         self, user_id: str, role: str, content: str, db: AsyncSession
@@ -416,6 +595,7 @@ class ResumeAgent:
         if cached:
             return self._history_from_cache(cached)
 
+        # 历史消息优先从 Redis 取，缓存未命中时再回源数据库。
         stmt = (
             select(ChatMessage)
             .where(ChatMessage.user_id == user_id)
@@ -431,7 +611,7 @@ class ResumeAgent:
                 ensure_ascii=False,
             ),
         )
-        return [self._to_langchain_message(message.role, message.content) for message in messages]
+        return [to_langchain_message(message.role, message.content) for message in messages]
 
     async def _get_cache_key(self, user_id: str) -> str:
         return f"chat_cache:{user_id}"
@@ -460,28 +640,14 @@ class ResumeAgent:
             role = str(item.get("role", ""))
             content = str(item.get("content", ""))
             if content:
-                history.append(self._to_langchain_message(role, content))
+                history.append(to_langchain_message(role, content))
         return history
-
-    def _coerce_model(self, value: Any, model_type: type[ModelT]) -> ModelT:
-        if isinstance(value, model_type):
-            return value
-        if isinstance(value, dict):
-            return model_type.model_validate(value)
-        if hasattr(value, "model_dump"):
-            return model_type.model_validate(value.model_dump())
-        return model_type.model_validate(value)
 
     def _load_rapidocr_module(self):
         try:
             return importlib.import_module("rapidocr_onnxruntime")
         except ImportError:
             return None
-
-    def _to_langchain_message(self, role: str, content: str) -> BaseMessage:
-        if role == "user":
-            return HumanMessage(content=content)
-        return AIMessage(content=content)
 
     def _build_vector_filter(
         self,
@@ -498,156 +664,3 @@ class ResumeAgent:
         if len(clauses) == 1:
             return clauses[0]
         return {"$and": clauses}
-
-    def _fallback_keywords(self, text: str) -> list[str]:
-        stopwords = {
-            "负责",
-            "熟悉",
-            "能力",
-            "经验",
-            "优先",
-            "相关",
-            "以上",
-            "具备",
-            "参与",
-            "本科",
-            "大专",
-            "岗位",
-            "职位",
-            "工作",
-            "公司",
-            "团队",
-            "产品",
-            "业务",
-            "要求",
-            "能够",
-            "我们",
-            "你将",
-        }
-        library = [
-            "Python",
-            "Java",
-            "Go",
-            "C++",
-            "JavaScript",
-            "TypeScript",
-            "React",
-            "Vue",
-            "Node.js",
-            "SQL",
-            "MySQL",
-            "PostgreSQL",
-            "Redis",
-            "Kafka",
-            "Docker",
-            "Kubernetes",
-            "LangChain",
-            "RAG",
-            "LLM",
-            "AI",
-            "机器学习",
-            "深度学习",
-            "数据分析",
-            "项目管理",
-            "沟通协作",
-        ]
-        matched_library = [item for item in library if item.lower() in text.lower()]
-        tokens = re.findall(r"[A-Za-z][A-Za-z0-9+#./-]{1,}|[\u4e00-\u9fff]{2,8}", text)
-        keywords = [token for token in tokens if token not in stopwords and len(token) >= 2]
-        return self._unique_strings([*matched_library, *keywords])[:8]
-
-    def _normalize_keyword_candidates(self, candidates: Iterable[str], text: str) -> list[str]:
-        normalized: list[str] = []
-        for candidate in candidates:
-            keyword = candidate.strip().strip("，,。；;:：()[]{}")
-            if len(keyword) < 2 or len(keyword) > 30:
-                continue
-
-            match = re.search(re.escape(keyword), text, flags=re.IGNORECASE)
-            if match:
-                normalized.append(match.group(0).strip())
-
-        return self._unique_strings(normalized)
-
-    def _fallback_evaluation(
-        self, resume_text: str, jd_text: str, jd_keywords: Iterable[str]
-    ) -> dict:
-        lowered_resume = resume_text.lower()
-        keywords = self._unique_strings(list(jd_keywords))
-        matched = [keyword for keyword in keywords if keyword.lower() in lowered_resume]
-        coverage = len(matched) / max(len(keywords), 1)
-        match_score = max(45, min(95, round(coverage * 100))) if keywords else 60
-        title = "高度匹配" if match_score >= 80 else "有一定匹配度" if match_score >= 65 else "建议谨慎评估"
-        summary = (
-            f"候选人与JD的整体匹配度约为 {match_score} 分。"
-            f"当前证据主要来自简历中出现的关键词：{', '.join(matched[:4]) or '暂未识别到明确重合项'}。"
-        )
-        highlights = [
-            f"简历中明确出现关键词：{keyword}" for keyword in matched[:4]
-        ] or ["简历已成功解析，可继续结合项目经历人工复核。"]
-        risks = []
-        missing = [keyword for keyword in keywords if keyword not in matched]
-        if missing:
-            risks.append(f"以下JD关键词在简历中缺少直接证据：{', '.join(missing[:4])}")
-        risks.append("当前结果为降级评估，建议结合面试继续确认细节。")
-        radar_metrics = [
-            metric.model_dump()
-            for metric in self._build_radar_metrics(match_score)
-        ]
-        return {
-            "summary": summary,
-            "title": title,
-            "decision": title,
-            "match_score": match_score,
-            "radar_metrics": radar_metrics,
-            "highlights": highlights,
-            "risks": risks,
-        }
-
-    def _build_radar_metrics(self, match_score: int) -> list[RadarMetric]:
-        metric_names = ["技术深度", "项目经验", "软技能", "背景示例", "AI技能"]
-        offsets = [0, -6, -10, -4, -8]
-        metrics: list[RadarMetric] = []
-        for index, name in enumerate(metric_names):
-            value = max(0, min(100, match_score + (offsets[index] if index < len(offsets) else -8)))
-            metrics.append(RadarMetric(name=name, value=value))
-        return metrics
-
-    def _chunk_to_text(self, chunk) -> str:
-        content = getattr(chunk, "content", "")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = []
-            for item in content:
-                if isinstance(item, str):
-                    parts.append(item)
-                elif isinstance(item, dict):
-                    text = item.get("text")
-                    if isinstance(text, str):
-                        parts.append(text)
-            return "".join(parts)
-        return ""
-
-    def _build_chat_fallback(self, question: str, context: str) -> str:
-        if context:
-            snippet = context[:500]
-            return (
-                "模型流式调用失败，以下是基于已检索简历片段的降级回答："
-                f"\n问题：{question}\n简历证据：{snippet}"
-            )
-        return "暂时无法生成回答，因为没有检索到可用的简历上下文。"
-
-    def _unique_strings(self, values: Iterable[str]) -> list[str]:
-        seen: set[str] = set()
-        result: list[str] = []
-        for value in values:
-            text = str(value).strip()
-            if not text:
-                continue
-            key = text.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append(text)
-        return result

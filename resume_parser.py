@@ -17,7 +17,8 @@ class ResumeParser:
     def _clean_text(self, text):
         text = text.replace("\t", " ")
         text = re.sub(r" +", " ", text)
-        text = re.sub(r"\n+", "\n", text)
+        # 保留段落边界，便于后续按经历/项目/教育等结构切分证据来源。
+        text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
     def extract_text(self, file_path):
@@ -42,7 +43,7 @@ class ResumeParser:
                 if row_text:
                     content.append(row_text)
 
-        raw_text = "\n".join(content)
+        raw_text = "\n\n".join(content)
         return self._clean_text(raw_text)
 
     def extract_from_pdf(self, file_path):
@@ -56,7 +57,7 @@ class ResumeParser:
             if text.strip():
                 content.append(text)
 
-        return self._clean_text("\n".join(content))
+        return self._clean_text("\n\n".join(content))
 
     def get_chunks(self, text):
         chunks = []

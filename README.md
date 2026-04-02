@@ -1,10 +1,10 @@
 # Resume Agent (简历智能体)
 
 ## 🌟 项目简介
-这是一个基于 Google Gemini 3 Flash 构建的智能简历解析与评估系统。与传统的关键词匹配不同，它通过 向量检索 (RAG) 技术，让 AI 具备了对候选人履历的“长效记忆”与“深度理解”能力，能够像资深猎头一样洞察简历背后的潜力和风险。
+这是一个基于 Gemini 构建的招聘 AI 后端，覆盖 JD 分析、简历解析、流式评估、追问聊天和模拟面试智能体。与传统关键词匹配不同，它通过 RAG 检索和结构化输出，让 AI 能基于证据做招聘判断，并把结论映射回具体简历片段。
 
 ## 技术架构
-1. 解析层：支持 .docx 格式解析，利用自定义分段逻辑保留上下文。
+1. 解析层：支持 `.docx` / `.pdf` 简历解析，利用自定义分段逻辑保留上下文。
 
 2. 存储层：
 
@@ -12,16 +12,35 @@
 - PostgreSQL: 持久化存储用户对话历史。
 - Redis: 提供高速会话缓存，优化响应延迟。
 
-3. 推理层：调用 Gemini 3 Flash 模型，结合检索到的上下文（Context）生成专业评估。
+3. 推理层：调用 Gemini 模型，结合检索到的上下文生成专业评估、聊天回答与模拟面试结果。
 
 ## 核心功能
-- 支持上传简历，并且对指定人员提问
+- 上传并解析简历，写入向量库
+- 分析 JD 并提取关键词
+- 流式返回简历评估过程与证据来源
+- 对指定候选人发起流式追问，并返回回答依据
+- 启动模拟面试智能体，生成 10 道问题并统一评分
 
 
 ## 快速开始
+```bash
 python server.py
+```
 
-在swagger页面进行接口调用
+启动后可在 Swagger 页面调试接口。
+
+## 关键接口
+- `POST /analyze_jd`
+- `POST /ocr_jd_image`
+- `POST /upload_resume`
+- `GET /resumes`
+- `POST /evaluate`
+- `POST /evaluate_stream`
+- `POST /chat`
+- `POST /interview/start_stream`
+- `POST /interview/submit`
+- `POST /interview/history`
+- `GET /interview/history/{session_id}`
 
 ## 学习笔记：AI 应用开发的思考
 在开发本项目过程中，我重点解决以下 AI 工程化难题：
