@@ -1,7 +1,8 @@
 import hashlib
 import json
+from typing import Optional
 
-from agent import ResumeAgent
+from agents.resume_agent import ResumeAgent
 from agent_prompts import build_interview_questions_prompt, build_interview_submit_prompt
 from agent_utils import (
     coerce_model,
@@ -37,6 +38,7 @@ class InterviewAgent:
         resume: Resume,
         jd_text: str,
         jd_keywords: list[str] | None,
+        db,
     ) -> tuple[list[str], dict, list[dict[str, str]]]:
         if not resume.content:
             raise ValueError("resume content missing")
@@ -48,6 +50,7 @@ class InterviewAgent:
         evaluation = resume.evaluation_result or await self.agent.evaluate_resume(
             resume_text=resume.content,
             jd_text=jd_text,
+            db=db,
             jd_keywords=jd_keywords,
         )
         return keywords, evaluation, sources
@@ -81,6 +84,7 @@ class InterviewAgent:
         resume: Resume,
         jd_text: str,
         jd_keywords: list[str] | None,
+        db,
     ) -> list[dict]:
         cache_key = self.build_cache_key(user_id, resume, jd_text)
         cached_questions = await self.get_cached_questions(cache_key)
@@ -91,11 +95,13 @@ class InterviewAgent:
             resume=resume,
             jd_text=jd_text,
             jd_keywords=jd_keywords,
+            db=db,
         )
         questions = await self.generate_interview_questions(
             candidate_name=resume.candidate_name or "候选人",
             resume_text=resume.content or "",
             jd_text=jd_text,
+            db=db,
             keywords=keywords,
             evaluation=evaluation,
             sources=sources,
@@ -110,16 +116,19 @@ class InterviewAgent:
         jd_text: str,
         jd_keywords: list[str] | None,
         answers: list[InterviewAnswerInput],
+        db,
     ) -> dict:
         keywords, evaluation, _ = await self._prepare_interview_materials(
             resume=resume,
             jd_text=jd_text,
             jd_keywords=jd_keywords,
+            db=db,
         )
         return await self.submit_interview_answers(
             candidate_name=resume.candidate_name or "候选人",
             resume_text=resume.content or "",
             jd_text=jd_text,
+            db=db,
             keywords=keywords,
             evaluation=evaluation,
             answers=answers,
@@ -132,6 +141,7 @@ class InterviewAgent:
         resume: Resume,
         jd_text: str,
         jd_keywords: list[str] | None,
+        db,
     ) -> None:
         try:
             await self.prepare(
@@ -139,6 +149,7 @@ class InterviewAgent:
                 resume=resume,
                 jd_text=jd_text,
                 jd_keywords=jd_keywords,
+                db=db,
             )
         except Exception:
             return
@@ -148,9 +159,12 @@ class InterviewAgent:
         candidate_name: str,
         resume_text: str,
         jd_text: str,
+        db,
         keywords: list[str],
         evaluation: dict | None,
         sources: list[dict[str, str]],
+        source: str = "production",
+        request_id: Optional[str] = None,
     ) -> list[dict]:
         source_block = format_sources_for_prompt(sources)
         normalized_sources = normalize_sources(None, sources)
@@ -163,10 +177,12 @@ class InterviewAgent:
         risks_text = "\n".join(f"- {item['text']}" for item in risks) or "- 暂无明确风险"
 
         try:
-            structured_llm = self.agent.evaluation_llm.with_structured_output(InterviewQuestionsResponse)
             prompt = build_interview_questions_prompt(self.agent.system_instruction)
-            raw_result = await (prompt | structured_llm).ainvoke(
-                {
+            run = await self.agent._invoke_structured(
+                db=db,
+                prompt=prompt,
+                schema=InterviewQuestionsResponse,
+                payload={
                     "candidate_name": candidate_name,
                     "match_score": match_score,
                     "decision": decision,
@@ -176,9 +192,16 @@ class InterviewAgent:
                     "source_block": source_block,
                     "highlights_text": highlights_text,
                     "risks_text": risks_text,
-                }
+                },
+                model_name=self.agent.evaluation_llm.model,
+                source=source,
+                feature="interview",
+                stage="interview_questions",
+                prompt_name="interview_questions",
+                llm=self.agent.evaluation_llm,
+                request_id=request_id,
             )
-            result: InterviewQuestionsResponse = coerce_model(raw_result, InterviewQuestionsResponse)
+            result: InterviewQuestionsResponse = coerce_model(run.parsed_output, InterviewQuestionsResponse)
             questions = []
             allowed_source_ids = {source["source_id"] for source in normalized_sources}
             for index, item in enumerate(result.questions[:10], start=1):
@@ -210,9 +233,12 @@ class InterviewAgent:
         candidate_name: str,
         resume_text: str,
         jd_text: str,
+        db,
         keywords: list[str],
         evaluation: dict | None,
         answers: list[InterviewAnswerInput],
+        source: str = "production",
+        request_id: Optional[str] = None,
     ) -> dict:
         evaluation_payload = evaluation or {}
         decision = str(evaluation_payload.get("decision") or "待进一步评估")
@@ -225,10 +251,12 @@ class InterviewAgent:
         )
 
         try:
-            structured_llm = self.agent.evaluation_llm.with_structured_output(InterviewEvaluationLLMResult)
             prompt = build_interview_submit_prompt(self.agent.system_instruction)
-            raw_result = await (prompt | structured_llm).ainvoke(
-                {
+            run = await self.agent._invoke_structured(
+                db=db,
+                prompt=prompt,
+                schema=InterviewEvaluationLLMResult,
+                payload={
                     "candidate_name": candidate_name,
                     "keywords": ", ".join(keywords),
                     "jd_text": jd_text,
@@ -236,9 +264,16 @@ class InterviewAgent:
                     "decision": decision,
                     "match_score": match_score,
                     "qa_block": qa_block,
-                }
+                },
+                model_name=self.agent.evaluation_llm.model,
+                source=source,
+                feature="interview",
+                stage="interview_submit",
+                prompt_name="interview_submit",
+                llm=self.agent.evaluation_llm,
+                request_id=request_id,
             )
-            result: InterviewEvaluationLLMResult = coerce_model(raw_result, InterviewEvaluationLLMResult)
+            result: InterviewEvaluationLLMResult = coerce_model(run.parsed_output, InterviewEvaluationLLMResult)
             question_results = [
                 {
                     "question_id": item.question_id,

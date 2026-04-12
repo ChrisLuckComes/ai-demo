@@ -4,7 +4,7 @@ import importlib
 import os
 import tempfile
 from pathlib import Path
-from typing import AsyncIterator, cast
+from typing import Any, AsyncIterator, Optional, cast
 
 from dotenv import load_dotenv
 import cv2  # type: ignore[import-not-found]
@@ -15,6 +15,7 @@ import numpy as np
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from llm_runtime import LLMRuntime
 from models import (
     ChatMessage,
     ChatSuggestionsResponse,
@@ -59,17 +60,13 @@ from resume_parser import ResumeParser
 class ResumeAgent:
     def __init__(self, redis_client=None):
         load_dotenv()
-        gemini_api_key = os.getenv("GEMINI_API_KEY")
-        if gemini_api_key and not os.getenv("GOOGLE_API_KEY"):
-            os.environ["GOOGLE_API_KEY"] = gemini_api_key
+        self._normalize_api_key_env()
 
-        base_dir = Path(__file__).resolve().parent
-        # LLM 负责推理与生成，embedding 负责把简历切片转成向量用于检索。
+        base_dir = Path(__file__).resolve().parent.parent
         self.llm = ChatGoogleGenerativeAI(
             model=os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash"),
             temperature=0.2,
         )
-        # 评估链路更强调稳定性，因此单独使用低温模型，减少同输入下的结果漂移。
         self.evaluation_llm = ChatGoogleGenerativeAI(
             model=os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash"),
             temperature=0,
@@ -79,7 +76,6 @@ class ResumeAgent:
         )
         rapidocr_module = self._load_rapidocr_module()
         self.ocr_engine = rapidocr_module.RapidOCR() if rapidocr_module is not None else None
-        # Chroma 持久化保存简历分片，后续聊天和评估都从这里做语义检索。
         self.vector_store = Chroma(
             collection_name="resume_agent",
             embedding_function=self.embeddings,
@@ -91,13 +87,73 @@ class ResumeAgent:
         self.system_instruction = SYSTEM_INSTRUCTION
         self.jd_keyword_timeout_seconds = float(os.getenv("JD_KEYWORD_TIMEOUT_SECONDS", "15"))
         self.jd_keyword_prompt = build_jd_keyword_prompt()
-        self.jd_keyword_chain = self.jd_keyword_prompt | self.llm.with_structured_output(JDKeywordExtractionResult)
+        self.jd_keyword_chain = self.jd_keyword_prompt | self.llm.with_structured_output(
+            JDKeywordExtractionResult,
+            include_raw=True,
+        )
+
+    def _normalize_api_key_env(self) -> None:
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        google_api_key = os.getenv("GOOGLE_API_KEY")
+
+        if google_api_key:
+            os.environ["GOOGLE_API_KEY"] = google_api_key
+            if gemini_api_key:
+                os.environ.pop("GEMINI_API_KEY", None)
+            return
+
+        if gemini_api_key:
+            os.environ["GOOGLE_API_KEY"] = gemini_api_key
+            os.environ.pop("GEMINI_API_KEY", None)
+
+    def _build_llm(self, *, model_name: Optional[str], temperature: float, top_p: Optional[float], max_tokens: Optional[int]):
+        kwargs: dict[str, Any] = {
+            "model": model_name or os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash"),
+            "temperature": temperature,
+        }
+        if top_p is not None:
+            kwargs["top_p"] = top_p
+        if max_tokens is not None:
+            kwargs["max_output_tokens"] = max_tokens
+        return ChatGoogleGenerativeAI(**kwargs)
+
+    async def _invoke_structured(
+        self,
+        *,
+        db: AsyncSession,
+        prompt,
+        schema: type,
+        payload: dict[str, Any],
+        model_name: str,
+        source: str,
+        feature: str,
+        stage: str,
+        prompt_name: str,
+        prompt_version_id: Optional[int] = None,
+        llm=None,
+        request_id: Optional[str] = None,
+        extra_json: Optional[dict[str, Any]] = None,
+    ):
+        runtime = LLMRuntime(db)
+        active_llm = llm or self.llm
+        structured_llm = active_llm.with_structured_output(schema, include_raw=True)
+        return await runtime.invoke_structured(
+            runnable=prompt | structured_llm,
+            payload=payload,
+            model_name=model_name,
+            source=source,
+            feature=feature,
+            stage=stage,
+            prompt_name=prompt_name,
+            prompt_version_id=prompt_version_id,
+            request_id=request_id,
+            extra_json=extra_json,
+        )
 
     async def extract_text_from_image(self, file_bytes: bytes, mime_type: str) -> OCRResponse:
         if self.ocr_engine is None:
             raise ValueError("未安装 rapidocr_onnxruntime，无法执行图片OCR")
 
-        # 先把上传的二进制图片解码成 OpenCV 可处理的矩阵，再交给 OCR 引擎识别。
         image_buffer = np.frombuffer(file_bytes, dtype=np.uint8)
         decoded_image = cv2.imdecode(image_buffer, cv2.IMREAD_COLOR)
         if decoded_image is None:
@@ -114,21 +170,32 @@ class ResumeAgent:
         self,
         question: str,
         answer: str,
+        db: AsyncSession,
         candidate_name: str | None = None,
+        source: str = "production",
+        request_id: Optional[str] = None,
     ) -> list[str]:
         prompt = build_follow_up_prompt()
         try:
-            structured_llm = self.llm.with_structured_output(ChatSuggestionsResponse)
-            raw_result = await (prompt | structured_llm).ainvoke(
-                {
-                    "candidate_name": candidate_name or "未指定",
-                    "question": question,
-                    "answer": answer,
-                }
+            payload = {
+                "candidate_name": candidate_name or "未指定",
+                "question": question,
+                "answer": answer,
+            }
+            run = await self._invoke_structured(
+                db=db,
+                prompt=prompt,
+                schema=ChatSuggestionsResponse,
+                payload=payload,
+                model_name=self.llm.model,
+                source=source,
+                feature="chat",
+                stage="follow_up_suggestions",
+                prompt_name="follow_up_suggestions",
+                llm=self.llm,
+                request_id=request_id,
             )
-            result: ChatSuggestionsResponse = coerce_model(
-                raw_result, ChatSuggestionsResponse
-            )
+            result: ChatSuggestionsResponse = coerce_model(run.parsed_output, ChatSuggestionsResponse)
             suggestions = unique_strings(result.suggestions)
             if suggestions:
                 return suggestions[:3]
@@ -149,15 +216,31 @@ class ResumeAgent:
 
         return JDAnalysisResponse(keywords=await self._extract_jd_keywords(cleaned_text))
 
-    async def _extract_jd_keywords(self, text: str) -> list[str]:
+    async def _extract_jd_keywords(self, text: str, db: AsyncSession | None = None) -> list[str]:
         try:
-            raw_result = await asyncio.wait_for(
-                self.jd_keyword_chain.ainvoke({"text": text}),
-                timeout=self.jd_keyword_timeout_seconds,
-            )
-            result: JDKeywordExtractionResult = coerce_model(
-                raw_result, JDKeywordExtractionResult
-            )
+            if db is not None:
+                run = await asyncio.wait_for(
+                    self._invoke_structured(
+                        db=db,
+                        prompt=self.jd_keyword_prompt,
+                        schema=JDKeywordExtractionResult,
+                        payload={"text": text},
+                        model_name=self.llm.model,
+                        source="production",
+                        feature="jd_analysis",
+                        stage="jd_keyword",
+                        prompt_name="jd_keyword",
+                        llm=self.llm,
+                    ),
+                    timeout=self.jd_keyword_timeout_seconds,
+                )
+                result: JDKeywordExtractionResult = coerce_model(run.parsed_output, JDKeywordExtractionResult)
+            else:
+                raw_result = await asyncio.wait_for(
+                    self.jd_keyword_chain.ainvoke({"text": text}),
+                    timeout=self.jd_keyword_timeout_seconds,
+                )
+                result = coerce_model(raw_result.get("parsed") if isinstance(raw_result, dict) else raw_result, JDKeywordExtractionResult)
             keywords = normalize_keyword_candidates(result.keywords, text)
             if keywords:
                 return keywords[:8]
@@ -170,6 +253,7 @@ class ResumeAgent:
         self,
         resume_text: str,
         jd_text: str,
+        db: AsyncSession,
         jd_keywords: list[str] | None = None,
     ) -> dict:
         keywords, sources = await self.prepare_evaluation_context(
@@ -179,6 +263,7 @@ class ResumeAgent:
         return await self.generate_evaluation(
             resume_text=resume_text,
             jd_text=jd_text,
+            db=db,
             keywords=keywords,
             sources=sources,
         )
@@ -189,7 +274,6 @@ class ResumeAgent:
         jd_keywords: list[str] | None = None,
     ) -> tuple[list[str], list[dict[str, str]]]:
         keywords = self.require_jd_keywords(jd_keywords)
-        # 先把简历拆成可引用证据，后面要求模型只能引用这些 source_id。
         sources = self.build_evaluation_sources(resume_text)
         return keywords, sources
 
@@ -206,25 +290,33 @@ class ResumeAgent:
         self,
         resume_text: str,
         jd_text: str,
+        db: AsyncSession,
         keywords: list[str],
         sources: list[dict[str, str]],
     ) -> dict:
         source_block = format_sources_for_prompt(sources)
 
         try:
-            structured_llm = self.evaluation_llm.with_structured_output(EvaluationResult)
             prompt = build_evaluation_prompt(self.system_instruction)
-            raw_result = await (prompt | structured_llm).ainvoke(
-                {
+            run = await self._invoke_structured(
+                db=db,
+                prompt=prompt,
+                schema=EvaluationResult,
+                payload={
                     "keywords": ", ".join(keywords),
                     "jd_text": jd_text,
                     "resume_text": resume_text,
                     "source_block": source_block,
-                }
+                },
+                model_name=self.evaluation_llm.model,
+                source="production",
+                feature="evaluate",
+                stage="evaluation_full",
+                prompt_name="evaluation_full",
+                llm=self.evaluation_llm,
             )
-            result: EvaluationResult = coerce_model(raw_result, EvaluationResult)
+            result: EvaluationResult = coerce_model(run.parsed_output, EvaluationResult)
             payload = result.model_dump()
-            # sources 以服务端切分结果为准，不信任模型回传的 sources，避免它把整份简历原样回显。
             payload["sources"] = normalize_sources(None, sources)
             payload["summary_source_ids"] = normalize_source_ids(
                 payload.get("summary_source_ids"), payload["sources"]
@@ -240,13 +332,13 @@ class ResumeAgent:
                 ]
             return payload
         except Exception:
-            # 结构化输出失败时降级到规则评估，保证接口仍能返回可用结果。
             return fallback_evaluation(resume_text, keywords, sources)
 
     async def evaluate_resume_in_steps(
         self,
         resume_text: str,
         jd_text: str,
+        db: AsyncSession,
         jd_keywords: list[str] | None = None,
     ) -> dict:
         keywords, sources = await self.prepare_evaluation_context(
@@ -256,11 +348,13 @@ class ResumeAgent:
         score_result = await self.generate_evaluation_score(
             resume_text=resume_text,
             jd_text=jd_text,
+            db=db,
             keywords=keywords,
         )
         summary_result = await self.generate_evaluation_summary(
             resume_text=resume_text,
             jd_text=jd_text,
+            db=db,
             keywords=keywords,
             sources=sources,
             match_score=score_result["match_score"],
@@ -270,6 +364,7 @@ class ResumeAgent:
             item_type="highlights",
             resume_text=resume_text,
             jd_text=jd_text,
+            db=db,
             keywords=keywords,
             sources=sources,
             match_score=score_result["match_score"],
@@ -280,6 +375,7 @@ class ResumeAgent:
             item_type="risks",
             resume_text=resume_text,
             jd_text=jd_text,
+            db=db,
             keywords=keywords,
             sources=sources,
             match_score=score_result["match_score"],
@@ -306,19 +402,28 @@ class ResumeAgent:
         self,
         resume_text: str,
         jd_text: str,
+        db: AsyncSession,
         keywords: list[str],
     ) -> dict:
         try:
-            structured_llm = self.evaluation_llm.with_structured_output(EvaluationScoreResult)
             prompt = build_evaluation_score_prompt(self.system_instruction)
-            raw_result = await (prompt | structured_llm).ainvoke(
-                {
+            run = await self._invoke_structured(
+                db=db,
+                prompt=prompt,
+                schema=EvaluationScoreResult,
+                payload={
                     "keywords": ", ".join(keywords),
                     "jd_text": jd_text,
                     "resume_text": resume_text,
-                }
+                },
+                model_name=self.evaluation_llm.model,
+                source="production",
+                feature="evaluate",
+                stage="evaluation_score",
+                prompt_name="evaluation_score",
+                llm=self.evaluation_llm,
             )
-            result: EvaluationScoreResult = coerce_model(raw_result, EvaluationScoreResult)
+            result: EvaluationScoreResult = coerce_model(run.parsed_output, EvaluationScoreResult)
             payload = result.model_dump()
             payload["match_score"] = max(0, min(100, int(payload["match_score"])))
             return payload
@@ -334,6 +439,7 @@ class ResumeAgent:
         self,
         resume_text: str,
         jd_text: str,
+        db: AsyncSession,
         keywords: list[str],
         sources: list[dict[str, str]],
         match_score: int,
@@ -342,19 +448,27 @@ class ResumeAgent:
         source_block = format_sources_for_prompt(sources)
         normalized_sources = normalize_sources(None, sources)
         try:
-            structured_llm = self.evaluation_llm.with_structured_output(EvaluationSummaryResult)
             prompt = build_evaluation_summary_prompt(self.system_instruction)
-            raw_result = await (prompt | structured_llm).ainvoke(
-                {
+            run = await self._invoke_structured(
+                db=db,
+                prompt=prompt,
+                schema=EvaluationSummaryResult,
+                payload={
                     "match_score": match_score,
                     "decision": decision,
                     "keywords": ", ".join(keywords),
                     "jd_text": jd_text,
                     "resume_text": resume_text,
                     "source_block": source_block,
-                }
+                },
+                model_name=self.evaluation_llm.model,
+                source="production",
+                feature="evaluate",
+                stage="evaluation_summary",
+                prompt_name="evaluation_summary",
+                llm=self.evaluation_llm,
             )
-            result: EvaluationSummaryResult = coerce_model(raw_result, EvaluationSummaryResult)
+            result: EvaluationSummaryResult = coerce_model(run.parsed_output, EvaluationSummaryResult)
             payload = result.model_dump()
             payload["summary_source_ids"] = normalize_source_ids(payload.get("summary_source_ids"), normalized_sources)
             return payload
@@ -370,6 +484,7 @@ class ResumeAgent:
         item_type: str,
         resume_text: str,
         jd_text: str,
+        db: AsyncSession,
         keywords: list[str],
         sources: list[dict[str, str]],
         match_score: int,
@@ -379,10 +494,12 @@ class ResumeAgent:
         source_block = format_sources_for_prompt(sources)
         normalized_sources = normalize_sources(None, sources)
         try:
-            structured_llm = self.evaluation_llm.with_structured_output(EvaluationItemsResult)
             prompt = build_evaluation_items_prompt(self.system_instruction, item_type)
-            raw_result = await (prompt | structured_llm).ainvoke(
-                {
+            run = await self._invoke_structured(
+                db=db,
+                prompt=prompt,
+                schema=EvaluationItemsResult,
+                payload={
                     "match_score": match_score,
                     "decision": decision,
                     "summary": summary,
@@ -390,9 +507,15 @@ class ResumeAgent:
                     "jd_text": jd_text,
                     "resume_text": resume_text,
                     "source_block": source_block,
-                }
+                },
+                model_name=self.evaluation_llm.model,
+                source="production",
+                feature="evaluate",
+                stage=f"evaluation_items_{item_type}",
+                prompt_name=f"evaluation_items_{item_type}",
+                llm=self.evaluation_llm,
             )
-            result: EvaluationItemsResult = coerce_model(raw_result, EvaluationItemsResult)
+            result: EvaluationItemsResult = coerce_model(run.parsed_output, EvaluationItemsResult)
             payload = result.model_dump()
             payload["items"] = normalize_evaluation_items(payload.get("items"), normalized_sources)
             return payload
@@ -424,7 +547,6 @@ class ResumeAgent:
 
         temp_path = ""
         try:
-            # 解析库依赖本地文件路径，因此先把上传文件落到临时文件。
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
                 temp_file.write(file_content)
                 temp_path = temp_file.name
@@ -437,7 +559,6 @@ class ResumeAgent:
         if not raw_text.strip():
             raise ValueError("简历内容为空，无法继续处理")
 
-        # 每份简历会被切成多个 chunk 入向量库，便于后续按问题检索局部证据。
         chunks = self.parser.get_chunks(raw_text)
         self.delete_resume_vectors(user_id=user_id, resume_id=resume_id)
         self.vector_store.add_texts(
@@ -484,7 +605,6 @@ class ResumeAgent:
             resume_id=resume_id,
         ):
             chunks.append(chunk)
-        # 非流式接口本质上复用了流式实现，只是把分块结果重新拼接起来。
         return "".join(chunks)
 
     async def get_chat_sources(
@@ -509,7 +629,6 @@ class ResumeAgent:
         candidate_name: str | None = None,
         resume_id: int | None = None,
     ) -> AsyncIterator[str]:
-        # 先读历史消息，再检索当前问题最相关的简历片段，最后把二者一起交给 LLM。
         chat_history = await self._load_history(user_id=user_id, db=db)
         context_docs = await self._retrieve_context_docs(
             question=question,
@@ -536,13 +655,11 @@ class ResumeAgent:
                     response_parts.append(text)
                     yield text
         except Exception:
-            # 流式生成失败时仍返回基于检索结果的降级答案，避免前端整段报错。
             fallback = build_chat_fallback(question=question, context=context)
             response_parts.append(fallback)
             yield fallback
 
         full_response = "".join(response_parts).strip()
-        # 用户问题和 AI 最终回答都会落库，用于多轮对话与缓存重建。
         await self._save_message(user_id=user_id, role="user", content=question, db=db)
         await self._save_message(user_id=user_id, role="ai", content=full_response, db=db)
 
@@ -554,7 +671,6 @@ class ResumeAgent:
         resume_id: int | None,
     ) -> list[dict[str, str]]:
         search_kwargs: dict[str, object] = {"k": 6}
-        # 通过 metadata filter 把检索范围限制到当前用户/当前简历，避免串数据。
         where = self._build_vector_filter(
             user_id=user_id, resume_id=resume_id, candidate_name=candidate_name
         )
@@ -569,7 +685,6 @@ class ResumeAgent:
             return []
 
         context_docs: list[dict[str, str]] = []
-        # 给每个召回片段分配一个 source_id，方便前端展示“答案依据”。
         for index, doc in enumerate(docs, start=1):
             snippet = doc.page_content.strip()
             if not snippet:
@@ -595,7 +710,6 @@ class ResumeAgent:
         if cached:
             return self._history_from_cache(cached)
 
-        # 历史消息优先从 Redis 取，缓存未命中时再回源数据库。
         stmt = (
             select(ChatMessage)
             .where(ChatMessage.user_id == user_id)

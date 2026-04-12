@@ -1,4 +1,18 @@
+from dataclasses import dataclass
+
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+from models import (
+    ChatSuggestionsResponse,
+    EvaluationItemsResult,
+    EvaluationScoreResult,
+    EvaluationSummaryResult,
+    InterviewEvaluationLLMResult,
+    InterviewQuestionsResponse,
+    JDKeywordExtractionResult,
+    PromptConfig,
+    PromptScenarioField,
+)
 
 
 SYSTEM_INSTRUCTION = (
@@ -9,6 +23,37 @@ SYSTEM_INSTRUCTION = (
     "结论要服务招聘决策，语言简洁、直接、可执行，避免空泛表扬。"
     "输出时优先引用具体事实，例如项目、技术、职责、年限、业务场景。"
 )
+
+
+@dataclass(frozen=True)
+class PromptScenario:
+    prompt_name: str
+    label: str
+    description: str
+    default_system_instruction: str
+    default_user_template: str
+    default_config: PromptConfig
+    fields: list[PromptScenarioField]
+    output_mode: str
+    output_schema_name: str | None
+    schema_type: type | None
+    builder: callable
+
+
+DEFAULT_PROMPT_CONFIG = PromptConfig(
+    model_name="gemini-2.5-flash",
+    temperature=0,
+    top_p=None,
+    max_tokens=None,
+)
+
+
+def extract_user_template(prompt: ChatPromptTemplate) -> str:
+    for message in reversed(prompt.messages):
+        template = getattr(getattr(message, "prompt", None), "template", None)
+        if isinstance(template, str):
+            return template
+    return ""
 
 
 def build_follow_up_prompt() -> ChatPromptTemplate:
@@ -356,3 +401,177 @@ def build_interview_submit_prompt(system_instruction: str) -> ChatPromptTemplate
             ),
         ]
     )
+
+
+PROMPT_SCENARIOS: dict[str, PromptScenario] = {
+    "jd_keyword": PromptScenario(
+        prompt_name="jd_keyword",
+        label="JD关键词提取",
+        description="从 JD 原文中提取结构化关键词。",
+        default_system_instruction="你是招聘JD关键词抽取助手。你的唯一任务是从输入原文中提取关键词。",
+        default_user_template=extract_user_template(build_jd_keyword_prompt()),
+        default_config=PromptConfig(model_name="gemini-2.5-flash", temperature=0.2, top_p=None, max_tokens=None),
+        fields=[PromptScenarioField(name="text", label="JD原文", description="原始 JD 内容。", multiline=True)],
+        output_mode="structured",
+        output_schema_name="JDKeywordExtractionResult",
+        schema_type=JDKeywordExtractionResult,
+        builder=lambda system_instruction: ChatPromptTemplate.from_messages(
+            [
+                ("system", system_instruction),
+                ("user", extract_user_template(build_jd_keyword_prompt())),
+            ]
+        ),
+    ),
+    "follow_up_suggestions": PromptScenario(
+        prompt_name="follow_up_suggestions",
+        label="追问问题生成",
+        description="根据当前问答生成下一轮追问建议。",
+        default_system_instruction="你是招聘顾问，请根据本轮问答生成 3 条适合继续追问的问题。",
+        default_user_template=extract_user_template(build_follow_up_prompt()),
+        default_config=PromptConfig(model_name="gemini-2.5-flash", temperature=0.2, top_p=None, max_tokens=None),
+        fields=[
+            PromptScenarioField(name="candidate_name", label="候选人", description="候选人名称。"),
+            PromptScenarioField(name="question", label="用户问题", description="当前用户问题。", multiline=True),
+            PromptScenarioField(name="answer", label="AI回答", description="上一轮 AI 回答。", multiline=True),
+        ],
+        output_mode="structured",
+        output_schema_name="ChatSuggestionsResponse",
+        schema_type=ChatSuggestionsResponse,
+        builder=lambda system_instruction: ChatPromptTemplate.from_messages(
+            [
+                ("system", system_instruction),
+                ("user", extract_user_template(build_follow_up_prompt())),
+            ]
+        ),
+    ),
+    "evaluation_score": PromptScenario(
+        prompt_name="evaluation_score",
+        label="评估分数生成",
+        description="生成候选人与 JD 的匹配分。",
+        default_system_instruction=SYSTEM_INSTRUCTION,
+        default_user_template=extract_user_template(build_evaluation_score_prompt(SYSTEM_INSTRUCTION)),
+        default_config=DEFAULT_PROMPT_CONFIG,
+        fields=[
+            PromptScenarioField(name="keywords", label="JD关键词", description="逗号分隔的 JD 关键词。"),
+            PromptScenarioField(name="jd_text", label="JD全文", description="完整 JD 内容。", multiline=True),
+            PromptScenarioField(name="resume_text", label="简历全文", description="完整简历内容。", multiline=True),
+        ],
+        output_mode="structured",
+        output_schema_name="EvaluationScoreResult",
+        schema_type=EvaluationScoreResult,
+        builder=build_evaluation_score_prompt,
+    ),
+    "evaluation_summary": PromptScenario(
+        prompt_name="evaluation_summary",
+        label="评估总结生成",
+        description="生成简历评估总结。",
+        default_system_instruction=SYSTEM_INSTRUCTION,
+        default_user_template=extract_user_template(build_evaluation_summary_prompt(SYSTEM_INSTRUCTION)),
+        default_config=DEFAULT_PROMPT_CONFIG,
+        fields=[
+            PromptScenarioField(name="match_score", label="匹配分", description="当前评估分数。"),
+            PromptScenarioField(name="decision", label="评估结论", description="当前评估结论。"),
+            PromptScenarioField(name="keywords", label="JD关键词", description="逗号分隔的 JD 关键词。"),
+            PromptScenarioField(name="jd_text", label="JD全文", description="完整 JD 内容。", multiline=True),
+            PromptScenarioField(name="resume_text", label="简历全文", description="完整简历内容。", multiline=True),
+            PromptScenarioField(name="source_block", label="证据块", description="可直接注入 prompt 的证据文本。", multiline=True),
+        ],
+        output_mode="structured",
+        output_schema_name="EvaluationSummaryResult",
+        schema_type=EvaluationSummaryResult,
+        builder=build_evaluation_summary_prompt,
+    ),
+    "evaluation_items_highlights": PromptScenario(
+        prompt_name="evaluation_items_highlights",
+        label="亮点生成",
+        description="生成带来源引用的候选人亮点。",
+        default_system_instruction=SYSTEM_INSTRUCTION,
+        default_user_template=extract_user_template(build_evaluation_items_prompt(SYSTEM_INSTRUCTION, "highlights")),
+        default_config=DEFAULT_PROMPT_CONFIG,
+        fields=[
+            PromptScenarioField(name="match_score", label="匹配分", description="当前评估分数。"),
+            PromptScenarioField(name="decision", label="评估结论", description="当前评估结论。"),
+            PromptScenarioField(name="summary", label="评估总结", description="当前总结内容。", multiline=True),
+            PromptScenarioField(name="keywords", label="JD关键词", description="逗号分隔的 JD 关键词。"),
+            PromptScenarioField(name="jd_text", label="JD全文", description="完整 JD 内容。", multiline=True),
+            PromptScenarioField(name="resume_text", label="简历全文", description="完整简历内容。", multiline=True),
+            PromptScenarioField(name="source_block", label="证据块", description="可直接注入 prompt 的证据文本。", multiline=True),
+        ],
+        output_mode="structured",
+        output_schema_name="EvaluationItemsResult",
+        schema_type=EvaluationItemsResult,
+        builder=lambda system_instruction: build_evaluation_items_prompt(system_instruction, "highlights"),
+    ),
+    "evaluation_items_risks": PromptScenario(
+        prompt_name="evaluation_items_risks",
+        label="风险生成",
+        description="生成带来源引用的候选人风险点。",
+        default_system_instruction=SYSTEM_INSTRUCTION,
+        default_user_template=extract_user_template(build_evaluation_items_prompt(SYSTEM_INSTRUCTION, "risks")),
+        default_config=DEFAULT_PROMPT_CONFIG,
+        fields=[
+            PromptScenarioField(name="match_score", label="匹配分", description="当前评估分数。"),
+            PromptScenarioField(name="decision", label="评估结论", description="当前评估结论。"),
+            PromptScenarioField(name="summary", label="评估总结", description="当前总结内容。", multiline=True),
+            PromptScenarioField(name="keywords", label="JD关键词", description="逗号分隔的 JD 关键词。"),
+            PromptScenarioField(name="jd_text", label="JD全文", description="完整 JD 内容。", multiline=True),
+            PromptScenarioField(name="resume_text", label="简历全文", description="完整简历内容。", multiline=True),
+            PromptScenarioField(name="source_block", label="证据块", description="可直接注入 prompt 的证据文本。", multiline=True),
+        ],
+        output_mode="structured",
+        output_schema_name="EvaluationItemsResult",
+        schema_type=EvaluationItemsResult,
+        builder=lambda system_instruction: build_evaluation_items_prompt(system_instruction, "risks"),
+    ),
+    "interview_questions": PromptScenario(
+        prompt_name="interview_questions",
+        label="面试问题生成",
+        description="生成结构化模拟面试问题。",
+        default_system_instruction=SYSTEM_INSTRUCTION,
+        default_user_template=extract_user_template(build_interview_questions_prompt(SYSTEM_INSTRUCTION)),
+        default_config=DEFAULT_PROMPT_CONFIG,
+        fields=[
+            PromptScenarioField(name="candidate_name", label="候选人", description="候选人名称。"),
+            PromptScenarioField(name="match_score", label="匹配分", description="当前评估分数。"),
+            PromptScenarioField(name="decision", label="评估结论", description="当前评估结论。"),
+            PromptScenarioField(name="keywords", label="JD关键词", description="逗号分隔的 JD 关键词。"),
+            PromptScenarioField(name="jd_text", label="JD全文", description="完整 JD 内容。", multiline=True),
+            PromptScenarioField(name="resume_text", label="简历全文", description="完整简历内容。", multiline=True),
+            PromptScenarioField(name="source_block", label="证据块", description="可直接注入 prompt 的证据文本。", multiline=True),
+            PromptScenarioField(name="highlights_text", label="亮点文本", description="格式化后的亮点文本。", multiline=True),
+            PromptScenarioField(name="risks_text", label="风险文本", description="格式化后的风险文本。", multiline=True),
+        ],
+        output_mode="structured",
+        output_schema_name="InterviewQuestionsResponse",
+        schema_type=InterviewQuestionsResponse,
+        builder=build_interview_questions_prompt,
+    ),
+    "interview_submit": PromptScenario(
+        prompt_name="interview_submit",
+        label="面试评分",
+        description="对完整模拟面试进行评分。",
+        default_system_instruction=SYSTEM_INSTRUCTION,
+        default_user_template=extract_user_template(build_interview_submit_prompt(SYSTEM_INSTRUCTION)),
+        default_config=DEFAULT_PROMPT_CONFIG,
+        fields=[
+            PromptScenarioField(name="candidate_name", label="候选人", description="候选人名称。"),
+            PromptScenarioField(name="keywords", label="JD关键词", description="逗号分隔的 JD 关键词。"),
+            PromptScenarioField(name="jd_text", label="JD全文", description="完整 JD 内容。", multiline=True),
+            PromptScenarioField(name="resume_text", label="简历全文", description="完整简历内容。", multiline=True),
+            PromptScenarioField(name="decision", label="评估结论", description="当前评估结论。"),
+            PromptScenarioField(name="match_score", label="匹配分", description="当前评估分数。"),
+            PromptScenarioField(name="qa_block", label="问答块", description="格式化后的面试问答文本。", multiline=True),
+        ],
+        output_mode="structured",
+        output_schema_name="InterviewEvaluationLLMResult",
+        schema_type=InterviewEvaluationLLMResult,
+        builder=build_interview_submit_prompt,
+    ),
+}
+
+
+def get_prompt_scenario(prompt_name: str) -> PromptScenario:
+    scenario = PROMPT_SCENARIOS.get(prompt_name)
+    if scenario is None:
+        raise KeyError(prompt_name)
+    return scenario

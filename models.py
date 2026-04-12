@@ -4,7 +4,18 @@ import uuid
 from typing import Any, List, Optional
 
 from pydantic import BaseModel, Field
-from sqlalchemy import DateTime, Enum, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Enum,
+    Float,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
@@ -110,6 +121,55 @@ class InterviewSession(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.now, onupdate=datetime.now, nullable=False
+    )
+
+
+class PromptVersion(Base):
+    __tablename__ = "prompt_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    prompt_name: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    version_label: Mapped[str] = mapped_column(String(80), nullable=False)
+    system_instruction: Mapped[str] = mapped_column(Text, nullable=False)
+    user_template: Mapped[str] = mapped_column(Text, nullable=False)
+    config_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, nullable=False)
+
+    __table_args__ = (
+        Index("ix_prompt_versions_name_created", "prompt_name", "created_at"),
+    )
+
+
+class ModelCallLog(Base):
+    __tablename__ = "model_call_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    request_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    feature: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    stage: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    model_name: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    prompt_name: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    prompt_version_id: Mapped[Optional[int]] = mapped_column(Integer, index=True, nullable=True)
+    input_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    output_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    input_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    estimated_cost: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    success: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    fallback_used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    extra_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, nullable=False)
+
+    __table_args__ = (
+        Index("ix_model_call_logs_created", "created_at"),
+        Index("ix_model_call_logs_source_created", "source", "created_at"),
+        Index("ix_model_call_logs_feature_created", "feature", "created_at"),
+        Index("ix_model_call_logs_prompt_created", "prompt_name", "created_at"),
     )
 
 
@@ -251,3 +311,133 @@ class InterviewSessionDetailResponse(BaseModel):
     result: dict[str, Any] = Field(default_factory=dict)
     created_at: str
     updated_at: str
+
+
+class PromptConfig(BaseModel):
+    model_name: str
+    temperature: float = Field(default=0, ge=0, le=2)
+    top_p: Optional[float] = Field(default=None, ge=0, le=1)
+    max_tokens: Optional[int] = Field(default=None, ge=1)
+
+
+class PromptVersionCreateRequest(BaseModel):
+    prompt_name: str
+    version_label: str
+    system_instruction: str
+    user_template: str
+    config: PromptConfig
+    note: Optional[str] = None
+
+
+class PromptVersionResponse(BaseModel):
+    id: int
+    prompt_name: str
+    version_label: str
+    system_instruction: str
+    user_template: str
+    config: PromptConfig
+    note: Optional[str] = None
+    created_at: str
+
+
+class PromptScenarioField(BaseModel):
+    name: str
+    label: str
+    description: str
+    multiline: bool = False
+
+
+class PromptScenarioResponse(BaseModel):
+    prompt_name: str
+    label: str
+    description: str
+    output_mode: str
+    output_schema_name: Optional[str] = None
+    default_system_instruction: str
+    default_user_template: str
+    default_config: PromptConfig
+    fields: List[PromptScenarioField] = Field(default_factory=list)
+
+
+class PromptPlaygroundRunRequest(BaseModel):
+    prompt_name: str
+    prompt_version_id: Optional[int] = None
+    system_instruction_override: Optional[str] = None
+    user_template_override: Optional[str] = None
+    variables: dict[str, Any] = Field(default_factory=dict)
+    model_name: Optional[str] = None
+    temperature: Optional[float] = Field(default=None, ge=0, le=2)
+    top_p: Optional[float] = Field(default=None, ge=0, le=1)
+    max_tokens: Optional[int] = Field(default=None, ge=1)
+    save_log: bool = True
+
+
+class UsageMetricsResponse(BaseModel):
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+
+
+class PromptPlaygroundRunResponse(BaseModel):
+    request_id: str
+    log_id: Optional[int] = None
+    resolved_prompt: dict[str, str]
+    parsed_output: Any = None
+    raw_output_preview: str = ""
+    usage: UsageMetricsResponse = Field(default_factory=UsageMetricsResponse)
+    latency_ms: int
+    estimated_cost: Optional[float] = None
+    success: bool
+    error_message: Optional[str] = None
+
+
+class ObservabilitySummaryResponse(BaseModel):
+    total_calls: int = 0
+    success_rate: float = 0
+    fallback_rate: float = 0
+    avg_latency_ms: float = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_tokens: int = 0
+    total_estimated_cost: float = 0
+
+
+class ObservabilityLogItemResponse(BaseModel):
+    id: int
+    request_id: str
+    source: str
+    feature: str
+    stage: str
+    model_name: str
+    prompt_name: str
+    prompt_version_id: Optional[int] = None
+    input_summary: str = ""
+    output_summary: str = ""
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    latency_ms: int
+    estimated_cost: Optional[float] = None
+    success: bool
+    fallback_used: bool
+    error_message: Optional[str] = None
+    created_at: str
+
+
+class ObservabilityLogsResponse(BaseModel):
+    items: List[ObservabilityLogItemResponse] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    page_size: int = 20
+
+
+class ObservabilityTrendPoint(BaseModel):
+    bucket: str
+    latency_ms_avg: float = 0
+    total_tokens: int = 0
+    total_estimated_cost: float = 0
+    total_calls: int = 0
+
+
+class ObservabilityTrendsResponse(BaseModel):
+    points: List[ObservabilityTrendPoint] = Field(default_factory=list)
